@@ -46,30 +46,55 @@ python orchestrator.py score
 
 ```
 run_search_cycle
- └─ naukri_client.search_jobs(keywords, location)
-     ├─ get_browser_context()            # launch_persistent_context, one Chrome window
-     ├─ ensure_logged_in(page)           # goto naukri.com, check URL for "mnjuser",
-     │                                   # else block waiting for manual login (<=5 min)
-     ├─ goto search results page
-     └─ for each job card on the page:
-         └─ extract {job_id, title, company, url} via JOB_CARD_SELECTOR /
-            JOB_TITLE_SELECTOR / JOB_COMPANY_SELECTOR
-     (context closed here — one browser session for the whole search)
+ └─ naukri_client.search_jobs_with_details(keywords, location)
+     ├─ get_browser_context()            # launch_persistent_context, ONE Chrome window
+     │                                   # for the entire run, added 2026-09-05
+     ├─ ensure_logged_in(page)           # ONCE for the whole run, not per job — goto
+     │                                   # naukri.com, check URL for "mnjuser", else
+     │                                   # block waiting for manual login (<=5 min)
+     ├─ _scrape_search_results(page, keywords, location, max_pages)
+     │   ├─ goto search results page
+     │   └─ for each job card on the page:
+     │       └─ extract {job_id, title, company, url} via JOB_CARD_SELECTOR /
+     │          JOB_TITLE_SELECTOR / JOB_COMPANY_SELECTOR
+     └─ for each job returned above, on the SAME page:
+         ├─ try: _scrape_job_details(page, job["url"])
+         │   ├─ goto job page                                    # no fresh context,
+         │   └─ extract description (JOB_DESCRIPTION_SELECTOR)   # no re-login —
+         │       + meta (JOB_META_SELECTOR, discarded by the caller) # same page/session
+         │   except Exception: log full traceback, description = ""
+         │     # added 2026-09-05 alongside the reuse fix -- with everything now built
+         │     # up in one list over the whole function (not persisted per-job by the
+         │     # caller as before), an uncaught exception here would otherwise lose
+         │     # every job's search-card info too, not just the failed job's description
+         ├─ results.append({**job, "description": description})
+         └─ log.info("Fetched details for job %d/%d...")   # added 2026-09-05 --
+            # the caller gets nothing back until this whole loop finishes now
+            # (unlike the old per-job get_job_details(), which let
+            # run_search_cycle() log progress after each one), so this is
+            # logged here instead to keep a run-in-progress visible
+     (context closed here — ONE browser session for the whole search AND every job's
+      detail fetch, not one per job)
 
- └─ for each job returned above:
-     ├─ naukri_client.get_job_details(job["url"])
-     │   ├─ get_browser_context()        # NOTE: opens a fresh Chrome window per job
-     │   ├─ ensure_logged_in(page)       # cheap re-check, already-logged-in case is fast
-     │   ├─ goto job page
-     │   └─ extract description (JOB_DESCRIPTION_SELECTOR) + meta (JOB_META_SELECTOR)
-     │   (context closed here)
-     └─ storage.upsert_job({**job, "description": ...})
+ └─ for each job in the returned list: storage.upsert_job(job)
+     # job already has job_id/title/company/url/description -- no merging needed
+     # at the call site any more (search_jobs_with_details did it internally)
 ```
 
-Known inefficiency, not yet fixed: `get_job_details()` opens/closes its own
-browser context per job rather than reusing the one from `search_jobs()` —
-correct, but ~10s slower per job than it needs to be. Fine at current volumes
-(~20 jobs/run); would matter if search volume grows a lot.
+Fixed 2026-09-05 (see DECISIONS.md): the old `search_jobs()` + per-job
+`get_job_details()` pattern opened a FRESH browser context (a full
+`launch_persistent_context()` profile reload) AND re-ran `ensure_logged_in()`
+(an extra navigation to the naukri.com homepage) before every single job's
+detail fetch — confirmed live to cost ~4.5 minutes for a 20-job search.
+`search_jobs()` and `get_job_details()` still exist unchanged as standalone,
+each-opens-its-own-context functions (now thin wrappers around the shared
+`_scrape_search_results()`/`_scrape_job_details()` helpers) — only
+`run_search_cycle()` was switched to the combined, single-session
+`search_jobs_with_details()`. Tradeoff: `ensure_logged_in()` no longer runs
+per job, so a session that expires mid-run wouldn't be caught until the next
+`search` invocation — accepted, since the whole run is now fast enough
+(seconds, not minutes) that a mid-run expiry is far less likely than it was
+in the multi-minute version.
 
 ## `run_scoring_cycle()` — orchestrator.py
 
@@ -201,6 +226,15 @@ description. This is how the LLM call in `scoring.py` reaches
 
 ### `_handle_screening_chatbot(page, job_id, answer_fn)` — naukri_client.py
 
+Split into three functions 2026-09-06 (see DECISIONS.md): reading DOM state
+(`_read_chatbot_turn_state`, Playwright-only), deciding what to do about it
+(`_decide_chatbot_turn`, PURE — no Playwright, no filesystem, no logging),
+and carrying that decision out (`_handle_screening_chatbot` itself — the
+Playwright actions, the resume-upload's own post-upload re-check, and all
+logging). `_decide_chatbot_turn` is what's actually covered by
+`tests/test_naukri_client.py`'s `DecideChatbotTurnTest` — no browser or
+Ollama needed to exercise every branch below.
+
 ```
 _handle_screening_chatbot   # only reached when AUTO_ANSWER_SCREENING_QUESTIONS=True
  ├─ qa_log = []   # accumulates {question, answer, options} per turn;
@@ -209,38 +243,64 @@ _handle_screening_chatbot   # only reached when AUTO_ANSWER_SCREENING_QUESTIONS=
  │                # a normal answer, so a surprising answer is diagnosable
  │                # after the fact without re-visiting a live page
  └─ loop up to MAX_CHATBOT_TURNS (6):
-     ├─ CHATBOT_APPLIED_BANNER_SELECTOR visible -> {applied: True, reason: "applied", qa_log}
-     ├─ no messages at all -> {applied: False, reason: "chatbot_state_unrecognized_manual_review", qa_log}
-     ├─ latest bot message text = the "question"
-     ├─ chip texts gathered, "Skip this question" excluded -> substantive_chips
-     ├─ substantive_chips non-empty (genuine chip-choice question)          [checked 1st]
-     │   ├─ answer_fn(question, substantive_chips) -> scoring.draft_screening_answer(...)
-     │   │   (always a single option now — see DECISIONS.md "Multi-select ...
-     │   │   reverted": Naukri's widget is single-select by platform design
-     │   │   even when the question reads as "which of these apply")
-     │   ├─ None or no match -> _try_skip_question() -> found a "Skip this
-     │   │   question" chip? click it, continue loop : else manual-review reason
-     │   └─ else -> click the matching chip, continue loop
-     ├─ no substantive chips, radio buttons present (CHATBOT_RADIO_SELECTOR) [checked 2nd]
-     │   ├─ options = label text per radio, via _radio_label()
-     │   ├─ answer_fn(question, options) -> None or no match -> _try_skip_question() as above
-     │   └─ else -> _select_radio_option() [clicks the <label>, not .check() the
-     │        input — see DECISIONS.md], then _click_send_button(), continue loop
-     ├─ text input present (CHATBOT_TEXT_INPUT_SELECTOR)                    [checked 3rd]
-     │   ├─ answer_fn(question, None) -> None -> _try_skip_question() as above
-     │   └─ else -> fill + _click_send_button(), continue loop
-     ├─ file input present (CHATBOT_FILE_INPUT_SELECTOR)                    [checked LAST]
-     │   ├─ Path(config.RESUME_PDF_PATH).is_file()? no -> {applied: False,
-     │   │    reason: "resume_pdf_not_found_manual_review"}          # added 2026-09-05
-     │   └─ yes -> set_input_files(...), jittered_wait(), then check for Naukri's
-     │        own "File upload was unsuccessful" text -> if present, {applied: False,
-     │        reason: "resume_upload_failed_manual_review"}              # added 2026-09-05
-     │      -> else continue loop (still not live-verified end-to-end --
-     │      see DECISIONS.md for why this moved to last: it's persistently present
-     │      in the DOM regardless of the current question, not a per-question signal)
-     ├─ none of the above matched -> _try_skip_question() -> found? continue :
-     └─   else -> {applied: False, reason: "chatbot_state_unrecognized_manual_review"}
+     ├─ state = _read_chatbot_turn_state(page)   # ALL Playwright reads for this turn,
+     │     bundled into one plain dict: applied_banner_visible, has_messages,
+     │     question, chip_texts (FULL list, skip chip included if present),
+     │     radio_options, text_input_present, file_input_present, resume_pdf_exists
+     ├─ action = _decide_chatbot_turn(state, answer_fn)   # PURE, see below
+     └─ dispatch on action["type"]:
+         ├─ "applied" -> {applied: True, reason: "applied", qa_log}
+         ├─ "no_messages" -> {applied: False, reason: "chatbot_state_unrecognized_manual_review", qa_log}
+         ├─ "click_chip" -> click chip at action["index"], append qa_entry, continue
+         ├─ "click_skip_chip" -> log "using Naukri's own Skip option", click chip
+         │     at action["index"], append qa_entry, continue
+         ├─ "manual_review" -> log via _MANUAL_REVIEW_LOG_MESSAGES[action["detail"]],
+         │     append qa_entry, return {applied: False, reason: action["reason"], qa_log}
+         ├─ "select_radio" -> _select_radio_option() [clicks the <label>, not .check()
+         │     the input — see DECISIONS.md] at action["index"], append qa_entry,
+         │     _click_send_button() -> False? return manual_review same qa_entry : continue
+         ├─ "fill_text" -> fill action["text"], append qa_entry, _click_send_button()
+         │     -> False? return manual_review same qa_entry : continue
+         └─ "attempt_resume_upload" -> the ONE action _decide_chatbot_turn can't fully
+               decide ahead of time (success/failure only knowable by reading the DOM
+               again AFTER acting) -- stays imperative:
+               set_input_files(config.RESUME_PDF_PATH), jittered_wait(), check for
+               Naukri's own "File upload was unsuccessful" text -> present? append
+               qa_entry(answer="(upload failed)"), return resume_upload_failed_manual_review
+               : append qa_entry(answer="(uploaded resume)"), continue
  └─ loop exhausted -> {applied: False, reason: "questionnaire_too_long_manual_review"}
+```
+
+`_decide_chatbot_turn(state, answer_fn)` — pure, checked in this order:
+
+```
+_decide_chatbot_turn
+ ├─ state["applied_banner_visible"] -> {"type": "applied"}
+ ├─ not state["has_messages"] -> {"type": "no_messages"}
+ ├─ substantive_chips = chip_texts with "skip this question" excluded
+ ├─ substantive_chips non-empty (genuine chip-choice question)          [checked 1st]
+ │   ├─ answer_fn(question, substantive_chips) -> scoring.draft_screening_answer(...)
+ │   │   (always a single option now — see DECISIONS.md "Multi-select ...
+ │   │   reverted": Naukri's widget is single-select by platform design
+ │   │   even when the question reads as "which of these apply")
+ │   ├─ None or no match among the FULL chip_texts -> skip_action() finds a "Skip
+ │   │   this question" chip in chip_texts? "click_skip_chip" at its index :
+ │   │   "manual_review" (detail "no_answer" or "no_chip_match")
+ │   └─ else -> "click_chip" at the matched index (into the FULL chip_texts,
+ │        not substantive_chips)
+ ├─ no substantive chips, radio_options non-empty                        [checked 2nd]
+ │   ├─ answer_fn(question, radio_options) -> None or no match -> skip_action() as above
+ │   └─ else -> "select_radio" at the matched index
+ ├─ text_input_present                                                   [checked 3rd]
+ │   ├─ answer_fn(question, None) -> None -> skip_action(None) as above
+ │   └─ else -> "fill_text"
+ ├─ file_input_present                                                   [checked LAST]
+ │   ├─ NO skip_action() check here, deliberately — a skip chip coexisting with the
+ │   │   file uploader specifically was never observed/considered; see DECISIONS.md
+ │   ├─ not resume_pdf_exists -> "manual_review" (detail "resume_pdf_not_found")
+ │   └─ else -> "attempt_resume_upload"
+ └─ none of the above matched -> skip_action(None) -> found? "click_skip_chip" :
+      "manual_review" (detail "no_mechanism")
 ```
 
 A chip list that's only `["Skip this question"]` (after excluding it,
@@ -256,7 +316,7 @@ is the only thing that can produce a real answer — it returns `None`
 **always** returns `None` for anything mentioning salary/CTC/compensation
 regardless of resume content — see `DECISIONS.md`'s "Expected-CTC
 calibration abandoned" entry for why. `None` no longer always stops the
-walk, though — see `_try_skip_question` above.
+walk, though — see `_decide_chatbot_turn`'s `skip_action()` above.
 
 For a fixed-option (chip/radio) question, a matched answer isn't returned
 immediately — it first goes through `_verify_screening_answer()`, a

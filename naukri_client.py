@@ -145,89 +145,174 @@ def _job_id_from_url(url: str) -> str:
     return url.rstrip("/").split("-")[-1].split("?")[0]
 
 
+def _scrape_search_results(page: Page, keywords: str, location: str, max_pages: int) -> list[dict]:
+    """Shared by search_jobs() and search_jobs_with_details() — assumes the
+    caller already has an open, logged-in `page`. Returns
+    [{job_id, title, company, url}, ...]."""
+    slug = keywords.strip().lower().replace(" ", "-")
+    location_suffix = f"-in-{location.strip().lower().replace(' ', '-')}" if location else ""
+    search_url = SEARCH_URL_TEMPLATE.format(keywords=slug, location_suffix=location_suffix)
+
+    page.goto(search_url, wait_until="domcontentloaded")
+    jittered_wait()
+
+    results: list[dict] = []
+    for page_num in range(1, max_pages + 1):
+        page.wait_for_selector(JOB_CARD_SELECTOR, timeout=30_000)
+        cards = page.locator(JOB_CARD_SELECTOR)
+        count = cards.count()
+        log.info("Page %d: found %d job cards.", page_num, count)
+
+        for i in range(count):
+            card = cards.nth(i)
+            title_el = card.locator(JOB_TITLE_SELECTOR).first
+            url = title_el.get_attribute("href")
+            if not url:
+                continue
+            title = title_el.inner_text().strip()
+            company = ""
+            if card.locator(JOB_COMPANY_SELECTOR).first.count():
+                company = card.locator(JOB_COMPANY_SELECTOR).first.inner_text().strip()
+
+            results.append(
+                {
+                    "job_id": _job_id_from_url(url),
+                    "title": title,
+                    "company": company,
+                    "url": url,
+                }
+            )
+
+        if page_num < max_pages:
+            next_btn = page.locator(NEXT_PAGE_SELECTOR).first
+            if not next_btn.count() or not next_btn.is_enabled():
+                log.info("No further pages.")
+                break
+            next_btn.click()
+            jittered_wait()
+
+    return results
+
+
+def _scrape_job_details(page: Page, job_url: str) -> dict:
+    """Shared by get_job_details() and search_jobs_with_details() — assumes
+    the caller already has an open, logged-in `page`. Returns
+    {job_id, url, description, meta}."""
+    page.goto(job_url, wait_until="domcontentloaded")
+    jittered_wait()
+
+    description = ""
+    if page.locator(JOB_DESCRIPTION_SELECTOR).first.count():
+        description = page.locator(JOB_DESCRIPTION_SELECTOR).first.inner_text().strip()
+
+    meta = ""
+    if page.locator(JOB_META_SELECTOR).first.count():
+        meta = page.locator(JOB_META_SELECTOR).first.inner_text().strip()
+
+    return {
+        "job_id": _job_id_from_url(job_url),
+        "url": job_url,
+        "description": description,
+        "meta": meta,
+    }
+
+
 def search_jobs(keywords: str, location: str = "", max_pages: int = 1) -> list[dict]:
-    """Returns [{job_id, title, company, url}, ...] for the given search."""
+    """Returns [{job_id, title, company, url}, ...] for the given search.
+    Opens and closes its own browser context — for the combined,
+    single-session search-then-details path used by run_search_cycle(),
+    see search_jobs_with_details() instead."""
+    playwright, context = get_browser_context()
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        ensure_logged_in(page)
+        return _scrape_search_results(page, keywords, location, max_pages)
+    finally:
+        context.close()
+        playwright.stop()
+
+
+def get_job_details(job_url: str) -> dict:
+    """Opens a job page and extracts description + metadata, ready for
+    storage.upsert_job(). Opens and closes its own browser context — for
+    the combined, single-session search-then-details path used by
+    run_search_cycle(), see search_jobs_with_details() instead."""
+    playwright, context = get_browser_context()
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        ensure_logged_in(page)
+        return _scrape_job_details(page, job_url)
+    finally:
+        context.close()
+        playwright.stop()
+
+
+def search_jobs_with_details(keywords: str, location: str = "", max_pages: int = 1) -> list[dict]:
+    """Combines search_jobs() + a get_job_details() call per result into a
+    SINGLE browser session: one context/page opened once, one
+    ensure_logged_in() call, reused for the search-results scrape AND every
+    job's detail fetch. Returns [{job_id, title, company, url, description}, ...]
+    -- the exact shape run_search_cycle() previously assembled by hand from
+    search_jobs() + get_job_details(), so storage.upsert_job(job) can be
+    called directly on each result with no merging at the call site (`meta`
+    is deliberately dropped, matching the old call site's behavior, which
+    only ever pulled `description` out of get_job_details()'s return value).
+
+    Added 2026-09-05 to fix a known inefficiency documented in FLOW.md:
+    the old per-job get_job_details() call opened a fresh
+    launch_persistent_context() (reloading the whole Chrome profile) AND
+    re-ran ensure_logged_in() (a full extra navigation to the naukri.com
+    homepage) before every single job's detail fetch. Confirmed live
+    2026-09-05: a 20-job search took ~4.5 minutes this way, each job
+    visibly gated behind a repeated "Already logged in." homepage
+    round-trip -- see DECISIONS.md for the before/after timing.
+
+    A single job's detail fetch failing (a dead link, a timeout, a broken
+    selector) is caught here and degrades that one job to an empty
+    description rather than losing the whole batch -- this matters more
+    now than it did for the old per-job-context design: everything used to
+    be returned in one list built up over the whole function, so an
+    uncaught exception here would previously have lost every job's search
+    result too (job_id/title/company/url included), not just the failed
+    job's description. The old per-job orchestrator loop didn't have this
+    problem only as a side effect of persisting each job immediately after
+    its own successful fetch; folding the loop in here needed this guard to
+    not be a net regression.
+    """
     playwright, context = get_browser_context()
     results: list[dict] = []
     try:
         page = context.pages[0] if context.pages else context.new_page()
         ensure_logged_in(page)
 
-        slug = keywords.strip().lower().replace(" ", "-")
-        location_suffix = f"-in-{location.strip().lower().replace(' ', '-')}" if location else ""
-        search_url = SEARCH_URL_TEMPLATE.format(keywords=slug, location_suffix=location_suffix)
+        jobs = _scrape_search_results(page, keywords, location, max_pages)
 
-        page.goto(search_url, wait_until="domcontentloaded")
-        jittered_wait()
-
-        for page_num in range(1, max_pages + 1):
-            page.wait_for_selector(JOB_CARD_SELECTOR, timeout=30_000)
-            cards = page.locator(JOB_CARD_SELECTOR)
-            count = cards.count()
-            log.info("Page %d: found %d job cards.", page_num, count)
-
-            for i in range(count):
-                card = cards.nth(i)
-                title_el = card.locator(JOB_TITLE_SELECTOR).first
-                url = title_el.get_attribute("href")
-                if not url:
-                    continue
-                title = title_el.inner_text().strip()
-                company = ""
-                if card.locator(JOB_COMPANY_SELECTOR).first.count():
-                    company = card.locator(JOB_COMPANY_SELECTOR).first.inner_text().strip()
-
-                results.append(
-                    {
-                        "job_id": _job_id_from_url(url),
-                        "title": title,
-                        "company": company,
-                        "url": url,
-                    }
+        for idx, job in enumerate(jobs, start=1):
+            try:
+                details = _scrape_job_details(page, job["url"])
+                description = details.get("description", "")
+            except Exception:
+                log.error(
+                    "Job %s (%s): failed to fetch details - keeping the job with an "
+                    "empty description rather than losing the whole batch.",
+                    job["job_id"],
+                    job.get("title", ""),
+                    exc_info=True,
                 )
-
-            if page_num < max_pages:
-                next_btn = page.locator(NEXT_PAGE_SELECTOR).first
-                if not next_btn.count() or not next_btn.is_enabled():
-                    log.info("No further pages.")
-                    break
-                next_btn.click()
-                jittered_wait()
+                description = ""
+            results.append({**job, "description": description})
+            # With the whole loop now inside this function (see the docstring
+            # above), the caller gets nothing back until every job is done --
+            # unlike the old per-job get_job_details() call, which let
+            # run_search_cycle() log progress after each one. Logged here
+            # instead so a run in progress is still visible, not silent until
+            # the very end.
+            log.info("Fetched details for job %d/%d: %s (%s)", idx, len(jobs), job["job_id"], job.get("title", ""))
     finally:
         context.close()
         playwright.stop()
 
     return results
-
-
-def get_job_details(job_url: str) -> dict:
-    """Opens a job page and extracts description + metadata, ready for
-    storage.upsert_job()."""
-    playwright, context = get_browser_context()
-    try:
-        page = context.pages[0] if context.pages else context.new_page()
-        ensure_logged_in(page)
-
-        page.goto(job_url, wait_until="domcontentloaded")
-        jittered_wait()
-
-        description = ""
-        if page.locator(JOB_DESCRIPTION_SELECTOR).first.count():
-            description = page.locator(JOB_DESCRIPTION_SELECTOR).first.inner_text().strip()
-
-        meta = ""
-        if page.locator(JOB_META_SELECTOR).first.count():
-            meta = page.locator(JOB_META_SELECTOR).first.inner_text().strip()
-
-        return {
-            "job_id": _job_id_from_url(job_url),
-            "url": job_url,
-            "description": description,
-            "meta": meta,
-        }
-    finally:
-        context.close()
-        playwright.stop()
 
 
 # --- Write actions below are stubbed for Phase 1. Dry-run/pause/cap gates
@@ -277,80 +362,216 @@ def _click_send_button(page: Page, job_id: str) -> bool:
     return False
 
 
+# Naukri's own escape hatch for a single question it can't get an answer
+# to — a chip literally worded "Skip this question", rendered with the
+# exact same class as every other chip (chatbot_Chip.chipInRow.chipItem).
+# Live-verified 2026-09-01: it can coexist with a free-text input
+# (chatbot_InputContainer) on the SAME question — i.e. its presence
+# doesn't mean "this is a chip-choice question," it means "you may skip
+# this one specific question and the conversation continues," regardless
+# of what kind of question it is. This is not a guess or a fabricated
+# answer — it's Naukri's own sanctioned "move on without answering"
+# action, which is exactly why it's safe to use automatically even though
+# a fabricated answer would not be. See DECISIONS.md and
+# _decide_chatbot_turn()'s skip_action() below.
 SKIP_QUESTION_CHIP_TEXT = "skip this question"
 
 
-def _find_skip_chip(page: Page):
-    """Naukri's own escape hatch for a single question it can't get an
-    answer to — a chip literally worded "Skip this question", rendered
-    with the exact same class as every other chip
-    (chatbot_Chip.chipInRow.chipItem). Live-verified 2026-09-01: it can
-    coexist with a free-text input (chatbot_InputContainer) on the SAME
-    question — i.e. its presence doesn't mean "this is a chip-choice
-    question," it means "you may skip this one specific question and the
-    conversation continues," regardless of what kind of question it is.
-    Returns the chip's locator, or None if not present this turn."""
+def _read_chatbot_turn_state(page: Page) -> dict:
+    """All the Playwright/DOM reads needed to decide one turn of the
+    screening chatbot, bundled into a plain-data snapshot. Kept separate
+    from _decide_chatbot_turn() (added 2026-09-05, see DECISIONS.md) so the
+    actual decision logic can run against a hand-built dict in tests, with
+    no Page/browser involved at all.
+
+    "question" is "" when has_messages is False (no question to read yet).
+    chip_texts is the FULL, unfiltered chip list (skip chip included, if
+    present) — filtering it down to "real" choices is _decide_chatbot_turn's
+    job, not this function's, since which chip is the skip chip is itself
+    part of the decision, not just the reading.
+    """
+    applied_banner_visible = page.locator(CHATBOT_APPLIED_BANNER_SELECTOR).count() > 0
+
+    messages = page.locator(CHATBOT_MESSAGE_SELECTOR)
+    has_messages = messages.count() > 0
+    question = messages.last.inner_text().strip() if has_messages else ""
+
     chips = page.locator(CHATBOT_CHIP_SELECTOR)
-    for i in range(chips.count()):
-        if chips.nth(i).inner_text().strip().lower() == SKIP_QUESTION_CHIP_TEXT:
-            return chips.nth(i)
-    return None
+    chip_texts = [chips.nth(i).inner_text().strip() for i in range(chips.count())]
+
+    radios = page.locator(CHATBOT_RADIO_SELECTOR)
+    radio_options = [_radio_label(page, radios.nth(i)) for i in range(radios.count())]
+
+    return {
+        "applied_banner_visible": applied_banner_visible,
+        "has_messages": has_messages,
+        "question": question,
+        "chip_texts": chip_texts,
+        "radio_options": radio_options,
+        "text_input_present": page.locator(CHATBOT_TEXT_INPUT_SELECTOR).count() > 0,
+        "file_input_present": page.locator(CHATBOT_FILE_INPUT_SELECTOR).count() > 0,
+        # Checked here, not inside _decide_chatbot_turn(), so that function
+        # stays free of filesystem access too, not just Playwright.
+        "resume_pdf_exists": Path(config.RESUME_PDF_PATH).is_file(),
+    }
 
 
-def _try_skip_question(page: Page, job_id: str, question: str, qa_log: list, options=None) -> bool:
-    """Called only when answer_fn couldn't produce a usable answer. Clicks
-    Naukri's own "Skip this question" chip if one is present THIS turn,
-    letting the conversation continue to the next question instead of
-    abandoning the whole application. This is not a guess or a fabricated
-    answer — it's Naukri's own sanctioned "move on without answering"
-    action, which is exactly why it's safe to use automatically even though
-    a fabricated answer would not be. Returns True if it skipped (caller
-    should `continue` the loop), False if no skip option existed (caller
-    falls through to manual review as before)."""
-    skip_chip = _find_skip_chip(page)
-    if skip_chip is None:
-        return False
-    log.info("Job %s: couldn't confidently answer %r — using Naukri's own Skip option.", job_id, question)
-    skip_chip.click()
-    qa_log.append(
-        {
-            "question": question,
-            "answer": "(skipped via Naukri's 'Skip this question')",
-            "options": options,
+def _decide_chatbot_turn(state: dict, answer_fn) -> dict:
+    """Pure decision logic for one turn of Naukri's screening chatbot — no
+    Playwright, no filesystem access, no logging. `state` comes from
+    _read_chatbot_turn_state(); `answer_fn` is the exact same callable
+    _handle_screening_chatbot() already receives (a plain, deterministic
+    stub in tests; a real LLM call via scoring.draft_screening_answer in
+    production — this function doesn't know or care which, matching the
+    module-boundary rule in FLOW.md).
+
+    This is the actual bug-prone logic that's caused every real screening-
+    chatbot incident on record (see DECISIONS.md): the substantive-chip-vs-
+    skip-chip filtering, the chip/radio/text/file check ORDER (file last,
+    on purpose — it's chat-widget furniture persistently present in the
+    DOM, not a per-question signal; checking it first was the original
+    bug), and the can't-answer/no-match -> try-skip -> else-manual-review
+    fallback repeated across chip/radio/text. Extracted 2026-09-05
+    specifically so tests/test_naukri_client.py can exercise all of it
+    without a browser or Ollama.
+
+    Returns an action dict; see _handle_screening_chatbot() for how each
+    "type" is carried out and logged:
+      {"type": "applied"}
+      {"type": "no_messages"}
+      {"type": "click_chip", "index": int, "qa_entry": {...}}
+      {"type": "click_skip_chip", "index": int, "qa_entry": {...}}
+      {"type": "manual_review", "detail": str, "reason": str, "qa_entry": {...}, "answer"?: str}
+      {"type": "select_radio", "index": int, "qa_entry": {...}}
+      {"type": "fill_text", "text": str, "qa_entry": {...}}
+      {"type": "attempt_resume_upload"}
+    "qa_entry" is always {"question", "answer", "options"} ready to append
+    to qa_log as-is.
+    """
+    if state["applied_banner_visible"]:
+        return {"type": "applied"}
+
+    if not state["has_messages"]:
+        return {"type": "no_messages"}
+
+    question = state["question"]
+    chip_texts = state["chip_texts"]
+    substantive_chips = [t for t in chip_texts if t.lower() != SKIP_QUESTION_CHIP_TEXT]
+
+    def skip_action(options):
+        for i, t in enumerate(chip_texts):
+            if t.lower() == SKIP_QUESTION_CHIP_TEXT:
+                return {
+                    "type": "click_skip_chip",
+                    "index": i,
+                    "qa_entry": {
+                        "question": question,
+                        "answer": "(skipped via Naukri's 'Skip this question')",
+                        "options": options,
+                    },
+                }
+        return None
+
+    def cant_answer(options):
+        return skip_action(options) or {
+            "type": "manual_review",
+            "detail": "no_answer",
+            "reason": "questionnaire_required_manual_review",
+            "qa_entry": {"question": question, "answer": None, "options": options},
         }
-    )
-    return True
+
+    if substantive_chips:
+        answer = answer_fn(question, substantive_chips)
+        if answer is None:
+            return cant_answer(substantive_chips)
+        for i, t in enumerate(chip_texts):
+            if t == answer:
+                return {
+                    "type": "click_chip",
+                    "index": i,
+                    "qa_entry": {"question": question, "answer": answer, "options": substantive_chips},
+                }
+        return skip_action(substantive_chips) or {
+            "type": "manual_review",
+            "detail": "no_chip_match",
+            "reason": "questionnaire_required_manual_review",
+            "answer": answer,
+            "qa_entry": {"question": question, "answer": None, "options": substantive_chips},
+        }
+
+    radio_options = state["radio_options"]
+    if radio_options:
+        answer = answer_fn(question, radio_options)
+        if answer is None:
+            return cant_answer(radio_options)
+        for i, opt in enumerate(radio_options):
+            if opt == answer:
+                return {
+                    "type": "select_radio",
+                    "index": i,
+                    "qa_entry": {"question": question, "answer": answer, "options": radio_options},
+                }
+        return skip_action(radio_options) or {
+            "type": "manual_review",
+            "detail": "no_radio_match",
+            "reason": "questionnaire_required_manual_review",
+            "answer": answer,
+            "qa_entry": {"question": question, "answer": None, "options": radio_options},
+        }
+
+    if state["text_input_present"]:
+        answer = answer_fn(question, None)
+        if answer is None:
+            return cant_answer(None)
+        return {"type": "fill_text", "text": answer, "qa_entry": {"question": question, "answer": answer, "options": None}}
+
+    if state["file_input_present"]:
+        # No skip check here, deliberately — matches the original behavior:
+        # a skip chip coexisting with the file uploader was never
+        # considered, since every real question seen so far has offered a
+        # skip chip alongside chips/radio/text, never alongside the
+        # uploader specifically.
+        if not state["resume_pdf_exists"]:
+            return {
+                "type": "manual_review",
+                "detail": "resume_pdf_not_found",
+                "reason": "resume_pdf_not_found_manual_review",
+                "qa_entry": {"question": question, "answer": None, "options": None},
+            }
+        return {"type": "attempt_resume_upload"}
+
+    return skip_action(None) or {
+        "type": "manual_review",
+        "detail": "no_mechanism",
+        "reason": "chatbot_state_unrecognized_manual_review",
+        "qa_entry": {"question": question, "answer": None, "options": None},
+    }
+
+
+_MANUAL_REVIEW_LOG_MESSAGES = {
+    "no_answer": "Job %s: couldn't confidently answer %r from resume - manual review.",
+    "no_chip_match": "Job %s: drafted answer %r didn't match any chip - manual review.",
+    "no_radio_match": "Job %s: drafted answer %r didn't match any radio option - manual review.",
+    "no_mechanism": "Job %s: chatbot showed a message with no recognized input mechanism - manual review.",
+    "resume_pdf_not_found": "Job %s: configured resume PDF %s not found - can't upload, manual review.",
+}
 
 
 def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
     """Walks Naukri's screening-question chatbot turn by turn. Only called
     when config.AUTO_ANSWER_SCREENING_QUESTIONS is True (checked by the
     caller). `answer_fn(question: str, options: list[str] | None) -> str |
-    None` drafts each answer — None means "can't confidently answer." That
-    no longer always stops the walk: if Naukri offers its own "Skip this
-    question" chip this turn (see _try_skip_question), that's used instead,
-    and the conversation continues to the next question. Only when no skip
-    option exists does an unanswerable question stop the walk for manual
-    review — the walk never fabricates an answer either way.
-
-    Per turn, the "real" input mechanism is chosen from chip options with
-    the skip chip excluded — a chip list that, once skip is excluded, is
-    empty means this isn't a genuine chip-choice question (the skip chip
-    can coexist with a text input on the same question; see
-    _find_skip_chip). Checked in that order: substantive chips, radio
-    buttons, free-text input, and only last — when none of those matched —
-    the file uploader. That last-resort ordering matters:
-    CHATBOT_FILE_INPUT_SELECTOR matches an <input type=file> that's
-    persistently present in the drawer regardless of the current question
-    (chat-widget furniture, not a per-question signal). Checking it first
-    was the original bug — see the comment above the selector constants for
-    what that looked like live.
-
-    Chip and radio answers submit differently: a chip click appeared to
-    auto-submit in the one flow that exercised it; a radio selection needs
-    an explicit send-button click afterward (checked separately, via
-    _click_send_button, since the button starts disabled until something is
-    selected).
+    None` drafts each answer — None means "can't confidently answer," never
+    fabricated. All actual decision-making (which input mechanism to use,
+    whether a drafted answer matches, when to fall back to Naukri's own
+    "Skip this question" chip vs. stopping for manual review) lives in
+    _decide_chatbot_turn() — this function just reads DOM state each turn
+    (_read_chatbot_turn_state), asks for a decision, and carries out
+    whatever action comes back: the Playwright clicks/fills, the
+    resume-upload's own post-upload failure check (the one place that
+    genuinely needs to read fresh DOM state again mid-turn, after an
+    action — not folded into the pure decision function, unlike everything
+    else), and all logging.
 
     Every return dict includes "qa_log": a list of {"question": str,
     "answer": str | None, "options": list[str] | None} covering every
@@ -358,152 +579,90 @@ def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
     that finally stopped the walk (no skip option available either), and
     options is the exact choice list offered for that question (None for
     free-text questions with no fixed choices), so a surprising answer is
-    diagnosable after the fact without needing to re-visit a live page —
-    added after a real answer ("Serving Notice Period" instead of an
-    expected "3 Months") couldn't be explained afterward because only the
-    chosen answer had been logged, not what it was chosen from. Consumed by
-    excel_log.log_application() for the human-readable audit trail."""
+    diagnosable after the fact without needing to re-visit a live page.
+    Consumed by excel_log.log_application() for the human-readable audit
+    trail."""
     qa_log: list[dict] = []
 
     for turn in range(MAX_CHATBOT_TURNS):
         jittered_wait()
 
-        if page.locator(CHATBOT_APPLIED_BANNER_SELECTOR).count() > 0:
+        state = _read_chatbot_turn_state(page)
+        action = _decide_chatbot_turn(state, answer_fn)
+        action_type = action["type"]
+
+        if action_type == "applied":
             log.info("Job %s: chatbot flow completed, application submitted.", job_id)
             return {"applied": True, "reason": "applied", "qa_log": qa_log}
 
-        messages = page.locator(CHATBOT_MESSAGE_SELECTOR)
-        if not messages.count():
+        if action_type == "no_messages":
             log.warning("Job %s: chatbot has no messages, can't determine the question.", job_id)
             return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
-        question = messages.last.inner_text().strip()
 
-        chips = page.locator(CHATBOT_CHIP_SELECTOR)
-        chip_count = chips.count()
-        chip_texts = [chips.nth(i).inner_text().strip() for i in range(chip_count)]
-        substantive_chips = [t for t in chip_texts if t.lower() != SKIP_QUESTION_CHIP_TEXT]
-
-        if substantive_chips:
-            answer = answer_fn(question, substantive_chips)
-            if answer is None:
-                if _try_skip_question(page, job_id, question, qa_log, options=substantive_chips):
-                    continue
-                log.warning(
-                    "Job %s: couldn't confidently answer %r from resume — manual review.", job_id, question
-                )
-                qa_log.append({"question": question, "answer": None, "options": substantive_chips})
-                return {"applied": False, "reason": "questionnaire_required_manual_review", "qa_log": qa_log}
-            matched = False
-            for i in range(chip_count):
-                if chip_texts[i] == answer:
-                    chips.nth(i).click()
-                    matched = True
-                    break
-            if not matched:
-                if _try_skip_question(page, job_id, question, qa_log, options=substantive_chips):
-                    continue
-                log.warning("Job %s: drafted answer %r didn't match any chip — manual review.", job_id, answer)
-                qa_log.append({"question": question, "answer": None, "options": substantive_chips})
-                return {"applied": False, "reason": "questionnaire_required_manual_review", "qa_log": qa_log}
-            qa_log.append({"question": question, "answer": answer, "options": substantive_chips})
+        if action_type == "click_chip":
+            page.locator(CHATBOT_CHIP_SELECTOR).nth(action["index"]).click()
+            qa_log.append(action["qa_entry"])
             continue
 
-        radios = page.locator(CHATBOT_RADIO_SELECTOR)
-        radio_count = radios.count()
-        if radio_count > 0:
-            options = [_radio_label(page, radios.nth(i)) for i in range(radio_count)]
-            answer = answer_fn(question, options)
-            if answer is None:
-                if _try_skip_question(page, job_id, question, qa_log, options=options):
-                    continue
-                log.warning(
-                    "Job %s: couldn't confidently answer %r from resume — manual review.", job_id, question
-                )
-                qa_log.append({"question": question, "answer": None, "options": options})
-                return {"applied": False, "reason": "questionnaire_required_manual_review", "qa_log": qa_log}
-            matched = False
-            for i in range(radio_count):
-                if options[i] == answer:
-                    _select_radio_option(page, radios.nth(i))
-                    matched = True
-                    break
-            if not matched:
-                if _try_skip_question(page, job_id, question, qa_log, options=options):
-                    continue
-                log.warning("Job %s: drafted answer %r didn't match any radio option — manual review.", job_id, answer)
-                qa_log.append({"question": question, "answer": None, "options": options})
-                return {"applied": False, "reason": "questionnaire_required_manual_review", "qa_log": qa_log}
+        if action_type == "click_skip_chip":
+            log.info(
+                "Job %s: couldn't confidently answer %r - using Naukri's own Skip option.",
+                job_id,
+                state["question"],
+            )
+            page.locator(CHATBOT_CHIP_SELECTOR).nth(action["index"]).click()
+            qa_log.append(action["qa_entry"])
+            continue
+
+        if action_type == "manual_review":
+            log_args = (job_id, action["answer"]) if "answer" in action else (job_id,)
+            if action["detail"] == "resume_pdf_not_found":
+                log_args = (job_id, config.RESUME_PDF_PATH)
+            elif action["detail"] == "no_answer":
+                log_args = (job_id, state["question"])
+            log.warning(_MANUAL_REVIEW_LOG_MESSAGES[action["detail"]], *log_args)
+            qa_log.append(action["qa_entry"])
+            return {"applied": False, "reason": action["reason"], "qa_log": qa_log}
+
+        if action_type == "select_radio":
+            _select_radio_option(page, page.locator(CHATBOT_RADIO_SELECTOR).nth(action["index"]))
+            qa_log.append(action["qa_entry"])
             if not _click_send_button(page, job_id):
-                qa_log.append({"question": question, "answer": answer, "options": options})
                 return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
-            qa_log.append({"question": question, "answer": answer, "options": options})
             continue
 
-        text_input = page.locator(CHATBOT_TEXT_INPUT_SELECTOR)
-        if text_input.count() > 0:
-            answer = answer_fn(question, None)
-            if answer is None:
-                if _try_skip_question(page, job_id, question, qa_log):
-                    continue
-                log.warning(
-                    "Job %s: couldn't confidently answer %r from resume — manual review.", job_id, question
-                )
-                qa_log.append({"question": question, "answer": None, "options": None})
-                return {"applied": False, "reason": "questionnaire_required_manual_review", "qa_log": qa_log}
-            text_input.first.fill(answer)
+        if action_type == "fill_text":
+            page.locator(CHATBOT_TEXT_INPUT_SELECTOR).first.fill(action["text"])
             jittered_wait()
+            qa_log.append(action["qa_entry"])
             if not _click_send_button(page, job_id):
-                qa_log.append({"question": question, "answer": answer, "options": None})
                 return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
-            qa_log.append({"question": question, "answer": answer, "options": None})
             continue
 
-        file_input = page.locator(CHATBOT_FILE_INPUT_SELECTOR)
-        if file_input.count() > 0:
-            # config.RESUME_PDF_PATH is a hardcoded absolute path outside
-            # this project's tree — nothing enforced it exists before
-            # handing it to set_input_files(), which raises if it doesn't.
-            # Uncaught, that exception used to propagate out of this whole
-            # function (and, before the try/except added around
-            # apply_to_job() in orchestrator.py, out of the entire apply
-            # cycle). Checked here instead so a stale/moved resume file
-            # degrades to manual review for this one job, not a crash.
-            if not Path(config.RESUME_PDF_PATH).is_file():
-                log.warning(
-                    "Job %s: configured resume PDF %s not found - can't upload, manual review.",
-                    job_id,
-                    config.RESUME_PDF_PATH,
-                )
-                qa_log.append({"question": question, "answer": None, "options": None})
-                return {"applied": False, "reason": "resume_pdf_not_found_manual_review", "qa_log": qa_log}
-
+        if action_type == "attempt_resume_upload":
+            # The one action whose outcome genuinely can't be decided ahead
+            # of time — whether the upload succeeded is only knowable by
+            # reading the DOM again AFTER performing it, so this stays
+            # imperative rather than folded into _decide_chatbot_turn().
             log.info("Job %s: no chip/radio/text mechanism found, uploading resume as last resort.", job_id)
-            file_input.first.set_input_files(config.RESUME_PDF_PATH)
+            page.locator(CHATBOT_FILE_INPUT_SELECTOR).first.set_input_files(config.RESUME_PDF_PATH)
             jittered_wait()
             # Naukri's own error text on a rejected upload (live-verified
             # once already — see DECISIONS.md's file-input-detection-order
-            # entry, where this exact message appeared after a bad upload
-            # attempt). Checking for it here means a rejected upload is
-            # flagged for review instead of silently treated as answered,
-            # which would otherwise let the loop re-show the same question
-            # up to MAX_CHATBOT_TURNS times before giving up.
+            # entry). Checking for it means a rejected upload is flagged
+            # for review instead of silently treated as answered, which
+            # would otherwise let the loop re-show the same question up to
+            # MAX_CHATBOT_TURNS times before giving up.
             if page.locator("text=/file upload was unsuccessful/i").count() > 0:
                 log.warning("Job %s: resume upload rejected by Naukri - manual review.", job_id)
-                qa_log.append({"question": question, "answer": "(upload failed)", "options": None})
+                qa_log.append({"question": state["question"], "answer": "(upload failed)", "options": None})
                 return {"applied": False, "reason": "resume_upload_failed_manual_review", "qa_log": qa_log}
-            qa_log.append({"question": question, "answer": "(uploaded resume)", "options": None})
+            qa_log.append({"question": state["question"], "answer": "(uploaded resume)", "options": None})
             continue
 
-        if _try_skip_question(page, job_id, question, qa_log):
-            continue
+        raise AssertionError(f"unreachable: unknown chatbot action type {action_type!r}")
 
-        log.warning(
-            "Job %s: chatbot showed a message with no recognized input mechanism — manual review.", job_id
-        )
-        qa_log.append({"question": question, "answer": None, "options": None})
-        return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
-
-    log.warning("Job %s: chatbot exceeded %d turns — manual review.", job_id, MAX_CHATBOT_TURNS)
+    log.warning("Job %s: chatbot exceeded %d turns - manual review.", job_id, MAX_CHATBOT_TURNS)
     return {"applied": False, "reason": "questionnaire_too_long_manual_review", "qa_log": qa_log}
 
 

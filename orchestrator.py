@@ -15,15 +15,17 @@ log = logging.getLogger("orchestrator")
 
 
 def run_search_cycle(keywords: str, location: str = ""):
-    """Search -> fetch details -> persist. Only touches already-working
-    Phase 1 code, so this is real, not a stub."""
+    """Search -> fetch details -> persist, all within one reused browser
+    session (see naukri_client.search_jobs_with_details). Replaces the
+    former search_jobs() + per-job get_job_details() pattern, which opened
+    a fresh browser context and re-checked login before every single job —
+    ~10s/job overhead, confirmed live 2026-09-05. See DECISIONS.md."""
     log.info("Searching for %r in %r...", keywords, location or "(any location)")
-    jobs = naukri_client.search_jobs(keywords, location)
+    jobs = naukri_client.search_jobs_with_details(keywords, location)
     log.info("Found %d jobs.", len(jobs))
 
     for job in jobs:
-        details = naukri_client.get_job_details(job["url"])
-        storage.upsert_job({**job, "description": details.get("description", "")})
+        storage.upsert_job(job)
         log.info("Saved job %s - %s at %s", job["job_id"], job["title"], job["company"])
 
     return jobs

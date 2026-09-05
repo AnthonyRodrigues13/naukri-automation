@@ -1115,4 +1115,149 @@ rather than commit either.
 they add both back locally — acceptable, since neither file is something
 a generic clone should need anyway (this is single-user, local automation,
 not a shareable tool with someone else's resume baked in).
-applications instead of 3.
+
+---
+
+## 2026-09-05 — Browser context reuse: `search_jobs_with_details()` replaces the per-job context churn in `run_search_cycle()`
+
+**Decision:** Added `naukri_client.search_jobs_with_details(keywords,
+location, max_pages)`, which opens ONE browser context, calls
+`ensure_logged_in()` ONCE, scrapes the search-results page, then reuses
+the SAME page to fetch every job's details — no fresh context, no
+re-login, per job. `search_jobs()` and `get_job_details()` still exist,
+unchanged in behavior, now as thin wrappers around two new shared private
+helpers (`_scrape_search_results()`, `_scrape_job_details()`) that assume
+an already-open page — only `orchestrator.run_search_cycle()` was
+switched to call the new combined function instead of `search_jobs()` +
+a per-job `get_job_details()` loop.
+
+**Context:** Documented as a known inefficiency in `FLOW.md` since
+Phase 1: `get_job_details()` opened/closed its own
+`launch_persistent_context()` (a full Chrome profile reload) AND re-ran
+`ensure_logged_in()` (an extra navigation to the naukri.com homepage) for
+every single job. Live-verified before/after with the identical query
+("AI ML Engineer" / "Pune", 20 jobs both times): **~4.5 minutes before**
+(2026-09-05, earlier in this session) **vs. 2m11s after** (2026-09-05,
+same session) — roughly 2x faster. The remaining time is real per-job
+work this change doesn't touch: one `page.goto(job_url)` +
+`jittered_wait()` per job is unavoidable (that's the actual page content
+being fetched), matching a reduction of roughly one `jittered_wait()`
+(2-8s) plus one homepage round-trip per job × 20 jobs, which lines up with
+the observed ~139s difference.
+
+**Alternatives considered:**
+- Pass an already-open `page`/`context` into `search_jobs()` and
+  `get_job_details()` as optional parameters instead of adding a new
+  function, defaulting to opening their own when not given — rejected:
+  this would leak browser-context lifecycle decisions into
+  `orchestrator.py`, which `FLOW.md` explicitly documents as never doing
+  Playwright-adjacent bookkeeping ("`naukri_client.py`... all Playwright/
+  DOM logic... and nowhere else"). Keeping context ownership entirely
+  inside `naukri_client.py` (one function that does it all internally)
+  respects that boundary; `orchestrator.py` still just calls one function
+  and gets a finished list back.
+- Fold the per-job try/except (see below) into the existing
+  `get_job_details()` instead of adding it fresh in
+  `search_jobs_with_details()` — not applicable; `get_job_details()` is
+  called once per job in isolation (a single failure there only ever
+  affected that one call), while the new function's loop needed its own
+  guard for a reason specific to combining everything into one call (see
+  below).
+
+**A second, necessary change bundled into the same commit:** a per-job
+`try/except` around the detail-fetch inside the new loop, degrading a
+failed job to an empty description rather than raising. This isn't scope
+creep — it's required BY the reuse refactor to avoid a real regression:
+under the old design, `run_search_cycle()` called `storage.upsert_job()`
+immediately after each job's own successful `get_job_details()`, so a
+crash on job 5 still left jobs 1-4 persisted. Under the new design, all
+20 jobs' results are built up in one list inside
+`search_jobs_with_details()` and only handed back (then persisted) after
+the whole loop finishes — an uncaught exception on job 5 would have lost
+every job's search-card info too (not just its description), including
+jobs 1-4 that had already succeeded. The try/except closes that gap.
+Also added a per-job progress log line inside the new function for the
+same underlying reason: the caller now gets nothing back until the whole
+loop finishes, so without it, a run in progress would go silent for the
+entire fetch phase instead of logging each job as it completes.
+
+**Tradeoff:** `ensure_logged_in()` no longer runs per job, so a session
+that happens to expire mid-run wouldn't be caught until the next `search`
+invocation, rather than being caught (and blocking for manual re-login)
+partway through. Accepted deliberately: the whole run is now ~2 minutes
+instead of ~4.5, making a mid-run session expiry considerably less likely
+than it already was in the slower version, and Naukri's session cookies
+are not observed to expire on anything close to a multi-minute timescale.
+
+---
+
+## 2026-09-06 — `_handle_screening_chatbot()` split into read/decide/act so the decision logic is finally unit-tested
+
+**Decision:** Split the screening chatbot's per-turn logic into three
+functions: `_read_chatbot_turn_state(page)` (Playwright-only — bundles
+every DOM read needed for one turn into a plain dict: banner visibility,
+message presence/text, the full unfiltered chip list, radio options,
+text/file input presence, and whether `config.RESUME_PDF_PATH` exists),
+`_decide_chatbot_turn(state, answer_fn)` (PURE — no Playwright, no
+filesystem, no logging; takes the state dict + the same `answer_fn`
+callable the caller already had, returns an action dict describing what to
+do), and `_handle_screening_chatbot(page, job_id, answer_fn)` itself,
+now a thin loop that reads state, asks for a decision, and dispatches on
+the action type — the actual Playwright clicks/fills, the resume-upload's
+own post-upload re-check (the one step that genuinely can't be decided
+ahead of time, since success/failure is only knowable by reading the DOM
+again after acting), and all logging. `_find_skip_chip()` and
+`_try_skip_question()` were deleted — their logic is now a local
+`skip_action()` closure inside `_decide_chatbot_turn()`.
+
+Added `tests/test_naukri_client.py::DecideChatbotTurnTest` (23 tests) —
+every branch of the actual decision logic (chip/radio/text/file check
+order, substantive-vs-skip chip filtering, can't-answer/no-match ->
+skip -> manual-review fallbacks, the file-input-checked-last ordering,
+the file-input-never-checks-skip exception) exercised with hand-built
+state dicts, zero browser or Ollama. Also added
+`HandleScreeningChatbotDispatchTest` (18 tests) covering the dispatch
+loop itself (each action type carried out correctly, qa_log entries,
+loop continuation vs. termination, `MAX_CHATBOT_TURNS` exhaustion) with
+`_decide_chatbot_turn` mocked to canned actions and a minimal mocked
+`Page`. This is the first test coverage this function has ever had — it's
+the most complex, most bug-prone code in the project (5 real bugs found
+only via live click-throughs per DECISIONS.md, two of which caused
+unintended real submissions) and previously had none.
+
+**Context:** From the codebase review's larger-initiatives item: every
+fix documented in this file for this function (file-input detection
+order, radio clicking via label not `.check()`, contenteditable text
+detection, chip-vs-skip-chip conflation, the multi-select-then-single-
+select correction) was found live, the hard way, because there was no way
+to exercise the decision logic offline. `answer_fn` was already a plain
+callable decoupled from Playwright (see the module-boundary rule in
+FLOW.md) — the missing piece was separating DOM-reading from
+decision-making so the decision half could be driven by hand-built state
+instead of a live page.
+
+**Alternatives considered:**
+- Leave `_handle_screening_chatbot()` as one function and add integration
+  tests against a real (or fake-server) Naukri page instead — rejected;
+  much higher cost (maintaining fixture HTML/a fake server that tracks
+  Naukri's actual, changing markup) for the same coverage of the part that
+  actually matters: the branching logic, not the CSS selectors themselves
+  (which are already flagged elsewhere as liable to break and need
+  re-verifying against a live page regardless of test coverage).
+- Fold the resume-upload's post-upload failure check into
+  `_decide_chatbot_turn()` too, for full symmetry — rejected: that check
+  can't be decided until AFTER the upload action has already happened, so
+  it isn't actually a "decide ahead of time" case like every other branch;
+  forcing it into the pure function would need a second decide-then-act
+  round trip for one specific action, adding complexity without adding
+  real test coverage (the check itself is a single fixed if/else on a
+  known Naukri error string, not branching logic worth isolating).
+
+**Tradeoff:** None significant — this changes internal structure, not
+behavior; every branch was checked line-by-line against the original code
+before and after, and `config.AUTO_ANSWER_SCREENING_QUESTIONS` (this
+function's own gate) stays `False` by default regardless, so this refactor
+carries no live risk unless and until that flag is deliberately flipped.
+The action-dict vocabulary (8 action types) is more moving parts than the
+original single function's straight-line branching — accepted as the
+direct cost of making the logic testable at all.
