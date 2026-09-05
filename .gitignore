@@ -1,0 +1,9 @@
+.browser_profile/
+*.db
+*.xlsx
+__pycache__/
+.venv/
+
+# Personal/PII: resume content, kept local-only. See DECISIONS.md.
+resume.md
+resume.pdf

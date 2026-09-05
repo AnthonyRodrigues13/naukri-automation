@@ -1,0 +1,334 @@
+"""Ties naukri_client + scoring + storage together. All three cycles —
+search, score, apply — are real and wired into main()."""
+
+import argparse
+import logging
+
+import config
+import excel_log
+import naukri_client
+import scoring
+import storage
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("orchestrator")
+
+
+def run_search_cycle(keywords: str, location: str = ""):
+    """Search -> fetch details -> persist. Only touches already-working
+    Phase 1 code, so this is real, not a stub."""
+    log.info("Searching for %r in %r...", keywords, location or "(any location)")
+    jobs = naukri_client.search_jobs(keywords, location)
+    log.info("Found %d jobs.", len(jobs))
+
+    for job in jobs:
+        details = naukri_client.get_job_details(job["url"])
+        storage.upsert_job({**job, "description": details.get("description", "")})
+        log.info("Saved job %s - %s at %s", job["job_id"], job["title"], job["company"])
+
+    return jobs
+
+
+def run_scoring_cycle():
+    """Scores every job in storage that hasn't been scored yet, against the
+    resume in config.RESUME_PATH. Does not apply to anything — that's
+    run_apply_cycle's job, gated separately by threshold + daily cap."""
+    resume_profile = scoring.load_resume_profile()
+    unscored = storage.get_unscored_jobs()
+    log.info("Scoring %d unscored job(s)...", len(unscored))
+
+    for job in unscored:
+        result = scoring.score_job(job.get("description") or "", resume_profile)
+        storage.upsert_job(
+            {
+                "job_id": job["job_id"],
+                "fit_score": result["fit_score"],
+                "reason": result["reason"],
+                "recommend_apply": result["recommend_apply"],
+            }
+        )
+        # result["fit_score"] is None only for a transport failure (see
+        # scoring.score_job) — storage.upsert_job just wrote fit_score back
+        # to NULL, so this job is still "unscored" and will be retried next
+        # cycle, not silently dropped. %d would raise on None, so branch on
+        # it explicitly rather than relying on %s to paper over the type.
+        if result["fit_score"] is None:
+            log.warning(
+                "Job %s (%s): scoring failed transiently (%s) - left unscored, will retry next cycle.",
+                job["job_id"],
+                job.get("title", ""),
+                result["reason"],
+            )
+        else:
+            log.info(
+                "Scored %s (%s): fit_score=%d recommend_apply=%s",
+                job["job_id"],
+                job.get("title", ""),
+                result["fit_score"],
+                result["recommend_apply"],
+            )
+
+
+def _prompt_yes(message: str) -> bool:
+    """Blocks on real terminal input. Never called during a dry run (see
+    run_apply_cycle) — only when a cycle is genuinely about to submit real
+    applications. Deliberately has no bypass flag: a flag to skip this
+    would recreate exactly the "ran out of habit, no real signal" gap
+    `--live` was already built to close (see DECISIONS.md). Tests patch
+    this function directly rather than stdin. Fails closed (aborts) on
+    EOFError/KeyboardInterrupt — a non-interactive invocation (e.g. cron)
+    with no one to answer must never fall through to "proceed" by default."""
+    try:
+        response = input(f'{message}\nType "yes" to proceed, anything else to abort: ')
+    except (EOFError, KeyboardInterrupt):
+        print()
+        log.warning("No confirmation received (no interactive input available) - aborting.")
+        return False
+    return response.strip().lower() == "yes"
+
+
+def _preflight_summary_and_confirm(candidates: list, applied_today: int) -> bool:
+    """Shown once, before a real apply cycle's loop starts (never during a
+    dry run) — a human-readable preview of exactly what's about to happen,
+    so a real cycle can't proceed on nothing but the LIVE MODE log line. See
+    DECISIONS.md."""
+    remaining = config.DAILY_APPLICATION_CAP - applied_today
+    to_attempt = candidates[:remaining]
+    lines = [
+        f"=== LIVE APPLY: about to attempt {len(to_attempt)} of {len(candidates)} "
+        f"candidate(s) for real ==="
+    ]
+    for job in to_attempt:
+        lines.append(f"  [{job.get('fit_score')}] {job.get('title', '')} @ {job.get('company', '')} ({job['job_id']})")
+    if len(candidates) > len(to_attempt):
+        lines.append(
+            f"  ...and {len(candidates) - len(to_attempt)} more beyond today's "
+            f"remaining cap, not attempted this run."
+        )
+    lines.append(
+        f"Daily cap {config.DAILY_APPLICATION_CAP}, already applied today "
+        f"{applied_today}, remaining {remaining}."
+    )
+    print("\n".join(lines))
+    return _prompt_yes("Proceed with these real applications?")
+
+
+def _confirm_after_apply_streak(recent: list, remaining_count: int) -> bool:
+    """Circuit breaker checkpoint: config.CIRCUIT_BREAKER_CONSECUTIVE_APPLIES
+    real applications in a row, no skip/failure in between. `recent` is a
+    list of (job_id, title, company) tuples for the streak just completed.
+    See DECISIONS.md."""
+    lines = [f"=== CIRCUIT BREAKER: {len(recent)} real applications submitted back-to-back ==="]
+    for job_id, title, company in recent:
+        lines.append(f"  {title} @ {company} ({job_id})")
+    lines.append(f"{remaining_count} candidate(s) remain this cycle.")
+    print("\n".join(lines))
+    return _prompt_yes("Continue applying?")
+
+
+def run_apply_cycle(live: bool = False):
+    """Applies to jobs at or above config.FIT_SCORE_THRESHOLD, capped by
+    config.DAILY_APPLICATION_CAP. Cap + pause enforcement happens here in
+    code, not just via the LLM's recommend_apply signal — matches the
+    project's hard safety rules. The cap is re-checked after every single
+    application, not just once at the top, since one run can apply to
+    several jobs.
+
+    `live` is True only when the CLI's `apply --live` flag was passed (see
+    main()). config.DRY_RUN alone gates real submissions everywhere else in
+    the codebase, but it's a file on disk — flip it to False, forget about
+    it, and the next `apply` invocation (weeks later, muscle memory typing
+    the same command as always) goes live with no signal that anything
+    changed. `live` is a second, explicit, per-invocation flag that can't be
+    left stale the way a file edit can: going live now requires BOTH
+    config.DRY_RUN=False on disk AND --live typed on this specific command
+    line. Either one being "safe" keeps the whole run a dry run.
+
+    Two more checkpoints only ever run for a genuinely real cycle (never a
+    dry run): _preflight_summary_and_confirm() shows every candidate about
+    to be attempted for real and requires a typed "yes" before the loop
+    starts at all, and _confirm_after_apply_streak() (the circuit breaker,
+    config.CIRCUIT_BREAKER_CONSECUTIVE_APPLIES) pauses for another typed
+    confirmation after that many real applies in a row with nothing
+    skipped in between. Neither has a bypass flag — see DECISIONS.md."""
+    if config.PAUSED:
+        log.warning("PAUSED is set — skipping apply cycle entirely.")
+        return
+
+    effective_dry_run = config.DRY_RUN or not live
+    if config.DRY_RUN and live:
+        log.info("--live was passed, but config.DRY_RUN is True on disk - this run stays a dry run.")
+    elif not config.DRY_RUN and not live:
+        log.warning(
+            "config.DRY_RUN is False on disk, but --live wasn't passed on the "
+            "command line - forcing this run to behave as a dry run. Re-run "
+            "as `apply --live` to actually submit real applications."
+        )
+
+    # Temporarily override the module-level config.DRY_RUN for the duration
+    # of this cycle so every other module that reads it directly
+    # (naukri_client.apply_to_job, excel_log.log_application, storage.mark_applied)
+    # sees the correctly-gated effective value without threading a new
+    # parameter through each of them. Restored in the finally block below —
+    # this must never leak past this function, including on an exception.
+    # Same in-process-only technique already used for live-testing, see
+    # DECISIONS.md's 2026-09-01 live-verification entries.
+    original_dry_run = config.DRY_RUN
+    config.DRY_RUN = effective_dry_run
+    try:
+        if not config.DRY_RUN:
+            log.warning(
+                "LIVE MODE - real applications will be submitted below, up "
+                "to the daily cap (%d).",
+                config.DAILY_APPLICATION_CAP,
+            )
+
+        applied_today = storage.count_applications_today()
+        if applied_today >= config.DAILY_APPLICATION_CAP:
+            log.info("Daily application cap (%d) already reached.", config.DAILY_APPLICATION_CAP)
+            return
+
+        candidates = storage.get_applicable_jobs(config.FIT_SCORE_THRESHOLD)
+        log.info("%d job(s) at or above fit_score threshold %d.", len(candidates), config.FIT_SCORE_THRESHOLD)
+
+        # Pre-flight checkpoint: only for a genuinely real cycle (never a
+        # dry run, including one forced back to dry-run above), and only
+        # when there's actually something to attempt. A real cycle must
+        # never proceed on the LIVE MODE log line alone.
+        if not config.DRY_RUN and candidates:
+            if not _preflight_summary_and_confirm(candidates, applied_today):
+                log.warning("Live apply cycle aborted at pre-flight confirmation - nothing attempted.")
+                return
+
+        resume_profile = scoring.load_resume_profile() if config.AUTO_ANSWER_SCREENING_QUESTIONS else None
+
+        consecutive_applies = 0
+        recent_applies: list = []
+
+        for idx, job in enumerate(candidates):
+            if applied_today >= config.DAILY_APPLICATION_CAP:
+                log.info("Daily application cap (%d) reached mid-cycle, stopping.", config.DAILY_APPLICATION_CAP)
+                break
+
+            answer_fn = None
+            if config.AUTO_ANSWER_SCREENING_QUESTIONS:
+                # Per-job closure (not built once outside the loop) so range-based
+                # answers (e.g. expected CTC) can be calibrated to *this* job's
+                # description — see scoring.draft_screening_answer.
+                job_description = job.get("description") or ""
+                answer_fn = lambda question, options, jd=job_description: scoring.draft_screening_answer(
+                    question, options, resume_profile, jd
+                )
+
+            try:
+                result = naukri_client.apply_to_job(job["job_id"], job["url"], answer_fn=answer_fn)
+            except Exception as e:
+                # apply_to_job() already closes its own browser context in a
+                # finally block, so this is just about what happens to the
+                # AUDIT TRAIL on an unexpected crash (a Playwright timeout, a
+                # malformed Ollama response bubbling up, etc.) instead of on a
+                # cleanly-returned outcome. Without this, an exception here
+                # propagates straight out of run_apply_cycle(), skipping both
+                # excel_log.log_application() and storage.mark_applied() for
+                # this job AND every candidate after it in the loop — for a
+                # real (non-dry-run) attempt, that means a real click could have
+                # happened with zero record of it. Treated the same as any other
+                # unclear outcome: not marked applied (conservative — a human
+                # can check the job page directly), but always logged. See
+                # DECISIONS.md.
+                log.error(
+                    "Job %s (%s): apply_to_job raised an unexpected error - "
+                    "logging as a failed attempt and continuing to the next job.",
+                    job["job_id"],
+                    job.get("title", ""),
+                    exc_info=True,
+                )
+                result = {"applied": False, "reason": f"unexpected_error: {e}", "qa_log": [], "external_url": None}
+
+            external_url = result.get("external_url")
+            if external_url:
+                storage.upsert_job({"job_id": job["job_id"], "external_apply_url": external_url})
+
+            excel_log.log_application(
+                company=job.get("company", ""),
+                title=job.get("title", ""),
+                job_id=job["job_id"],
+                url=job["url"],
+                fit_score=job.get("fit_score"),
+                fit_reason=job.get("reason", ""),
+                applied=result["applied"],
+                outcome_reason=result["reason"],
+                qa_log=result.get("qa_log", []),
+                dry_run=config.DRY_RUN,
+                external_url=external_url,
+            )
+
+            if result["reason"] in ("dry_run", "applied"):
+                storage.mark_applied(job["job_id"], dry_run=config.DRY_RUN)
+                if not config.DRY_RUN:
+                    applied_today += 1
+                log.info("%s (%s): %s", job["job_id"], job.get("title", ""), result["reason"])
+            else:
+                log.info("Skipped %s (%s): %s", job["job_id"], job.get("title", ""), result["reason"])
+
+            # Circuit breaker: result["reason"] == "applied" only ever
+            # happens for a genuinely real, successful submission (dry-run
+            # always returns reason="dry_run" instead — see
+            # naukri_client.apply_to_job) — a streak of anything else
+            # (skipped, failed, dry-run) resets the counter. Checked once
+            # per job, not just at the daily cap, since the failure shape
+            # this guards against (real incidents on record — see
+            # DECISIONS.md) is an unbroken run of real applies within one
+            # cycle, not merely hitting a volume ceiling.
+            if result["reason"] == "applied":
+                consecutive_applies += 1
+                recent_applies.append((job["job_id"], job.get("title", ""), job.get("company", "")))
+            else:
+                consecutive_applies = 0
+                recent_applies = []
+
+            if consecutive_applies >= config.CIRCUIT_BREAKER_CONSECUTIVE_APPLIES:
+                remaining_count = len(candidates) - idx - 1
+                if not _confirm_after_apply_streak(recent_applies, remaining_count):
+                    log.warning("Circuit breaker: user did not confirm continuing - stopping the apply cycle.")
+                    break
+                consecutive_applies = 0
+                recent_applies = []
+    finally:
+        config.DRY_RUN = original_dry_run
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Naukri job search + scoring")
+    subparsers = parser.add_subparsers(dest="cycle", required=True)
+
+    search_parser = subparsers.add_parser("search", help="search + scrape new jobs")
+    search_parser.add_argument("keywords", help='e.g. "python developer"')
+    search_parser.add_argument("location", nargs="?", default="", help='e.g. "Bangalore"')
+
+    subparsers.add_parser("score", help="score unscored jobs against resume.md")
+
+    apply_parser = subparsers.add_parser("apply", help="apply to jobs at/above the fit threshold, capped daily")
+    apply_parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Actually submit real applications. Requires config.DRY_RUN=False "
+            "on disk too - without --live, this command always behaves as a "
+            "dry run, even if config.DRY_RUN=False."
+        ),
+    )
+
+    args = parser.parse_args()
+    storage.init_db()
+
+    if args.cycle == "search":
+        run_search_cycle(args.keywords, args.location)
+    elif args.cycle == "score":
+        run_scoring_cycle()
+    elif args.cycle == "apply":
+        run_apply_cycle(live=args.live)
+
+
+if __name__ == "__main__":
+    main()
