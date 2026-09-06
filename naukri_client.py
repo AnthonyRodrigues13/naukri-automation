@@ -876,6 +876,110 @@ def apply_to_job(job_id: str, job_url: str, answer_fn=None) -> ApplyResult:
         playwright.stop()
 
 
+APPLICATION_HISTORY_PAGE_URL = BASE_URL + "/myapply/historypage"
+# The page's own API call, matched by substring in the response listener
+# below -- not called directly (see get_application_status_history()'s
+# docstring for why).
+APPLICATION_HISTORY_API_MARKER = "/applyapi/v5/history"
+
+
+def get_application_status_history() -> list[dict]:
+    """Read-only outcome tracking (added 2026-09-06, see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md): navigates to Naukri's own Application History
+    page and captures the response of ITS OWN natural API call, rather
+    than reconstructing the request by hand. Live-verified 2026-09-06:
+    that endpoint requires an `authorization: Bearer <JWT>` header plus
+    custom `appid`/`systemid` headers the page's own JS attaches — a
+    hand-built `context.request.get(...)` call, and a manual `fetch()` run
+    via `page.evaluate` from within the page's own JS context, both got a
+    400 with just session cookies. Replicating that handshake would mean
+    extracting and holding a real bearer credential by hand, which is more
+    fragile (breaks if Naukri rotates the auth mechanism) AND more
+    sensitive than just letting the page make its own authenticated call
+    and reading what it returns — matches how every other page in this
+    module is handled.
+
+    Only captures whatever the page's own default view loads (currently:
+    the most recent applications, newest first, page size decided by the
+    page itself) — pagination/older history beyond that isn't fetched.
+    Logs a warning if Naukri reports more total applications
+    (`matchingRowsCount`) than were actually captured, so a growing
+    application history doesn't silently go untracked once it exceeds one
+    page.
+
+    Returns [{"job_id": str, "ars_score": int | None, "is_open": bool,
+    "statuses": [{"status_id", "status_value", "status_datetime"}, ...]},
+    ...] — `statuses` is the exact list Naukri shows for that application
+    (e.g. "Applied", "Application Sent", and later "Application Viewed" /
+    "Shortlisted" / "Not Shortlisted" as a recruiter acts on it), oldest
+    first isn't guaranteed by Naukri so callers should sort by
+    `status_datetime` themselves (storage.record_application_status()
+    already does)."""
+    playwright, context = get_browser_context()
+    captured: dict = {}
+
+    def on_response(response):
+        if APPLICATION_HISTORY_API_MARKER in response.url:
+            try:
+                captured["data"] = response.json()
+            except Exception as e:
+                log.error("Application history: couldn't parse the API response: %s", e)
+
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        ensure_logged_in(page)
+        page.on("response", on_response)
+        page.goto(APPLICATION_HISTORY_PAGE_URL, wait_until="networkidle")
+        jittered_wait()
+    finally:
+        context.close()
+        playwright.stop()
+
+    data = captured.get("data")
+    if not data:
+        log.warning("Application history: no response captured from the history page.")
+        return []
+
+    apply_details = data.get("applyDetails", [])
+    try:
+        matching_count = int(data.get("matchingRowsCount"))
+    except (TypeError, ValueError):
+        matching_count = None
+    if matching_count is not None and matching_count > len(apply_details):
+        log.warning(
+            "Application history: Naukri reports %d total application(s) but only %d "
+            "were captured on this page (pagination not implemented) - older history "
+            "is not being tracked.",
+            matching_count,
+            len(apply_details),
+        )
+
+    results = []
+    for item in apply_details:
+        job_id = item.get("jobId")
+        if not job_id:
+            continue
+        is_open_raw = item.get("isOpen")
+        is_open = is_open_raw if isinstance(is_open_raw, bool) else str(is_open_raw).strip().lower() == "true"
+        results.append(
+            {
+                "job_id": job_id,
+                "ars_score": item.get("arsScore"),
+                "is_open": is_open,
+                "statuses": [
+                    {
+                        "status_id": s.get("statusId"),
+                        "status_value": s.get("statusValue"),
+                        "status_datetime": s.get("dateTime"),
+                    }
+                    for s in item.get("status", [])
+                    if s.get("statusValue") and s.get("dateTime")
+                ],
+            }
+        )
+    return results
+
+
 def get_inbox_messages():
     raise NotImplementedError("Inbox polling not implemented yet (Phase 3).")
 

@@ -7,3 +7,4 @@ __pycache__/
 # Personal/PII: resume content, kept local-only. See DECISIONS.md.
 resume.md
 resume.pdf
+JOB_SEARCH_STRATEGY.md

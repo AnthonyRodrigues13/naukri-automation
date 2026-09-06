@@ -3,6 +3,7 @@ search, score, apply — are real and wired into main()."""
 
 import argparse
 import logging
+from datetime import datetime
 
 import config
 import excel_log
@@ -25,6 +26,7 @@ def run_search_cycle(keywords: str, location: str = ""):
     description in jobs.db) have their detail fetch skipped entirely —
     see storage.get_job_ids_with_description() and
     naukri_client.search_jobs_with_details's skip_job_ids param."""
+    storage.record_run("search")
     log.info("Searching for %r in %r...", keywords, location or "(any location)")
     already_known = storage.get_job_ids_with_description()
     jobs = naukri_client.search_jobs_with_details(keywords, location, skip_job_ids=already_known)
@@ -41,6 +43,7 @@ def run_scoring_cycle():
     """Scores every job in storage that hasn't been scored yet, against the
     resume in config.RESUME_PATH. Does not apply to anything — that's
     run_apply_cycle's job, gated separately by threshold + daily cap."""
+    storage.record_run("score")
     resume_profile = scoring.load_resume_profile()
     unscored = storage.get_unscored_jobs()
     log.info("Scoring %d unscored job(s)...", len(unscored))
@@ -170,6 +173,7 @@ def run_apply_cycle(live: bool = False):
     config.CIRCUIT_BREAKER_CONSECUTIVE_APPLIES) pauses for another typed
     confirmation after that many real applies in a row with nothing
     skipped in between. Neither has a bypass flag — see DECISIONS.md."""
+    storage.record_run("apply")
     if config.PAUSED:
         log.warning("PAUSED is set — skipping apply cycle entirely.")
         return
@@ -330,6 +334,23 @@ def run_apply_cycle(live: bool = False):
         config.DRY_RUN = original_dry_run
 
 
+def _format_time_ago(iso_timestamp: str) -> str:
+    """"3 days ago" / "4 hours ago" / "just now" style formatting for
+    run_status_report()'s cadence section. Added 2026-09-06. Presentation
+    only -- storage.py returns raw ISO timestamps, this is the one place
+    that turns them into something a person reads at a glance."""
+    delta = datetime.now() - datetime.fromisoformat(iso_timestamp)
+    if delta.days >= 1:
+        return f"{delta.days} day{'s' if delta.days != 1 else ''} ago"
+    hours = delta.seconds // 3600
+    if hours >= 1:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    minutes = delta.seconds // 60
+    if minutes >= 1:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    return "just now"
+
+
 def run_status_report():
     """Read-only summary of jobs.db's current state -- "how did the last
     run go" without hand-written SQL (previously the README's own
@@ -347,6 +368,46 @@ def run_status_report():
             print(f"  {count:4d}  {outcome}")
     else:
         print("No apply attempts recorded yet.")
+
+    print("\nLast run:")
+    last_run_at = summary["last_run_at"]
+    for cycle in ("search", "score", "apply", "check-status"):
+        if cycle in last_run_at:
+            print(f"  {cycle}: {_format_time_ago(last_run_at[cycle])}")
+        else:
+            print(f"  {cycle}: never")
+
+
+def run_check_status_cycle():
+    """Outcome tracking (added 2026-09-06, see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md's automation-roadmap item 1): checks Naukri's
+    own Application History for status updates on jobs already applied
+    to, persists any new status entries, then prints the current
+    fit_score-vs-outcome picture. Entirely read-only against Naukri (a
+    page view, not a write action) — not gated by config.PAUSED, matching
+    run_search_cycle()/run_scoring_cycle()."""
+    storage.record_run("check-status")
+    log.info("Checking Naukri's application status history...")
+    history = naukri_client.get_application_status_history()
+    log.info("Found %d application(s) in Naukri's history.", len(history))
+
+    for item in history:
+        storage.record_application_status(item["job_id"], item["ars_score"], item["statuses"])
+        if item["statuses"]:
+            latest = max(item["statuses"], key=lambda s: s["status_datetime"])["status_value"]
+        else:
+            latest = "(no status recorded)"
+        log.info("Job %s: latest status = %s (Naukri ars_score=%s)", item["job_id"], latest, item["ars_score"])
+
+    correlation = storage.get_outcome_correlation()
+    if not correlation:
+        print("No application status history recorded yet.")
+        return
+    print(f"\n{'fit_score':>9}  {'ars_score':>9}  status")
+    for row in correlation:
+        fit = row["fit_score"] if row["fit_score"] is not None else "-"
+        ars = row["naukri_ars_score"] if row["naukri_ars_score"] is not None else "-"
+        print(f"{fit!s:>9}  {ars!s:>9}  {row['latest_apply_status']} - {row['title']} @ {row['company']}")
 
 
 def main():
@@ -372,6 +433,11 @@ def main():
 
     subparsers.add_parser("status", help="read-only summary of jobs.db's current state")
 
+    subparsers.add_parser(
+        "check-status",
+        help="check Naukri's own Application History for status updates on applied jobs (read-only)",
+    )
+
     args = parser.parse_args()
     storage.init_db()
 
@@ -383,6 +449,8 @@ def main():
         run_apply_cycle(live=args.live)
     elif args.cycle == "status":
         run_status_report()
+    elif args.cycle == "check-status":
+        run_check_status_cycle()
 
 
 if __name__ == "__main__":

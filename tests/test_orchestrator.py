@@ -16,6 +16,7 @@ input()-wrapping helper itself.
 
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +28,27 @@ import naukri_client
 import orchestrator
 import scoring
 import storage
+
+# storage.record_run() (added 2026-09-06 for cadence/staleness tracking,
+# see DECISIONS.md) is called at the top of every cycle function. Patched
+# module-wide here so every existing cycle-invoking test below doesn't
+# need its own mock for it (none of them care about its call args) and,
+# more importantly, doesn't silently write a real row into the real
+# jobs.db's run_history table. RecordRunWiringTest below overrides this
+# locally (nested patches compose correctly) to verify the actual call
+# args per cycle.
+_record_run_patcher = None
+
+
+def setUpModule():
+    global _record_run_patcher
+    _record_run_patcher = patch.object(storage, "record_run")
+    _record_run_patcher.start()
+
+
+def tearDownModule():
+    _record_run_patcher.stop()
+
 
 FAKE_JOB = {
     "job_id": "123",
@@ -329,6 +351,122 @@ class RunScoringCycleEmbeddingReuseTest(unittest.TestCase):
             orchestrator.run_scoring_cycle()
 
         mock_score_job.assert_not_called()
+
+
+class RunCheckStatusCycleTest(unittest.TestCase):
+    """Outcome tracking, added 2026-09-06 (see DECISIONS.md): wiring
+    between naukri_client.get_application_status_history() and
+    storage.record_application_status()."""
+
+    def test_each_history_entry_is_recorded(self):
+        history = [
+            {
+                "job_id": "1",
+                "ars_score": 44,
+                "is_open": True,
+                "statuses": [{"status_id": 1, "status_value": "Applied", "status_datetime": "2026-09-01 10:00:00"}],
+            },
+            {
+                "job_id": "2",
+                "ars_score": 10,
+                "is_open": False,
+                "statuses": [{"status_id": 1, "status_value": "Shortlisted", "status_datetime": "2026-09-02 09:00:00"}],
+            },
+        ]
+        with patch.object(
+            naukri_client, "get_application_status_history", return_value=history
+        ), patch.object(storage, "record_application_status") as mock_record, patch.object(
+            storage, "get_outcome_correlation", return_value=[]
+        ):
+            orchestrator.run_check_status_cycle()
+
+        self.assertEqual(mock_record.call_count, 2)
+        mock_record.assert_any_call("1", 44, history[0]["statuses"])
+        mock_record.assert_any_call("2", 10, history[1]["statuses"])
+
+    def test_empty_history_records_nothing(self):
+        with patch.object(naukri_client, "get_application_status_history", return_value=[]), patch.object(
+            storage, "record_application_status"
+        ) as mock_record, patch.object(storage, "get_outcome_correlation", return_value=[]):
+            orchestrator.run_check_status_cycle()
+
+        mock_record.assert_not_called()
+
+
+class RecordRunWiringTest(unittest.TestCase):
+    """Verifies storage.record_run(cycle_name) is called with the correct
+    name at the start of each cycle function -- cadence/staleness
+    tracking, added 2026-09-06 (see DECISIONS.md). Overrides the
+    module-wide storage.record_run patch locally to assert call args
+    (nested unittest.mock patches compose correctly)."""
+
+    def setUp(self):
+        self._original_dry_run = config.DRY_RUN
+        self._original_paused = config.PAUSED
+        config.DRY_RUN = True  # keeps run_apply_cycle on its simplest (dry-run) path
+        config.PAUSED = False
+
+    def tearDown(self):
+        config.DRY_RUN = self._original_dry_run
+        config.PAUSED = self._original_paused
+
+    def test_search_cycle_records_search(self):
+        with patch.object(storage, "record_run") as mock_record_run, patch.object(
+            storage, "get_job_ids_with_description", return_value=set()
+        ), patch.object(naukri_client, "search_jobs_with_details", return_value=[]), patch.object(
+            storage, "upsert_job"
+        ):
+            orchestrator.run_search_cycle("python developer", "Pune")
+        mock_record_run.assert_called_once_with("search")
+
+    def test_scoring_cycle_records_score(self):
+        with patch.object(storage, "record_run") as mock_record_run, patch.object(
+            scoring, "load_resume_profile", return_value="resume"
+        ), patch.object(storage, "get_unscored_jobs", return_value=[]):
+            orchestrator.run_scoring_cycle()
+        mock_record_run.assert_called_once_with("score")
+
+    def test_apply_cycle_records_apply(self):
+        with patch.object(storage, "record_run") as mock_record_run, patch.object(
+            storage, "count_applications_today", return_value=0
+        ), patch.object(storage, "get_applicable_jobs", return_value=[]):
+            orchestrator.run_apply_cycle(live=False)
+        mock_record_run.assert_called_once_with("apply")
+
+    def test_check_status_cycle_records_check_status(self):
+        with patch.object(storage, "record_run") as mock_record_run, patch.object(
+            naukri_client, "get_application_status_history", return_value=[]
+        ), patch.object(storage, "get_outcome_correlation", return_value=[]):
+            orchestrator.run_check_status_cycle()
+        mock_record_run.assert_called_once_with("check-status")
+
+
+class FormatTimeAgoTest(unittest.TestCase):
+    """Cadence/staleness tracking, added 2026-09-06 (see DECISIONS.md)."""
+
+    def test_days_ago(self):
+        ts = (datetime.now() - timedelta(days=3, hours=1)).isoformat()
+        self.assertEqual(orchestrator._format_time_ago(ts), "3 days ago")
+
+    def test_singular_day(self):
+        ts = (datetime.now() - timedelta(days=1, hours=1)).isoformat()
+        self.assertEqual(orchestrator._format_time_ago(ts), "1 day ago")
+
+    def test_hours_ago(self):
+        ts = (datetime.now() - timedelta(hours=4)).isoformat()
+        self.assertEqual(orchestrator._format_time_ago(ts), "4 hours ago")
+
+    def test_singular_hour(self):
+        ts = (datetime.now() - timedelta(hours=1, minutes=5)).isoformat()
+        self.assertEqual(orchestrator._format_time_ago(ts), "1 hour ago")
+
+    def test_minutes_ago(self):
+        ts = (datetime.now() - timedelta(minutes=5)).isoformat()
+        self.assertEqual(orchestrator._format_time_ago(ts), "5 minutes ago")
+
+    def test_just_now(self):
+        ts = datetime.now().isoformat()
+        self.assertEqual(orchestrator._format_time_ago(ts), "just now")
 
 
 if __name__ == "__main__":

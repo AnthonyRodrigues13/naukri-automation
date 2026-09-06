@@ -47,12 +47,17 @@ python orchestrator.py apply [--live]
 python orchestrator.py status
   main() -> run_status_report()          # added 2026-09-06, read-only, no storage.init_db()
                                           # side effects beyond the schema migration it already does
+
+python orchestrator.py check-status
+  main() -> run_check_status_cycle()     # added 2026-09-06, read-only against Naukri (a page
+                                          # view, not a write action) -- not gated by config.PAUSED
 ```
 
 ## `run_search_cycle(keywords, location)` — orchestrator.py
 
 ```
 run_search_cycle
+ ├─ storage.record_run("search")   # cadence tracking, added 2026-09-06 -- see run_status_report
  ├─ already_known = storage.get_job_ids_with_description()   # added 2026-09-06
  └─ naukri_client.search_jobs_with_details(keywords, location, skip_job_ids=already_known)
      ├─ get_browser_context()            # launch_persistent_context, ONE Chrome window
@@ -116,6 +121,7 @@ in the multi-minute version.
 
 ```
 run_scoring_cycle
+ ├─ storage.record_run("score")   # cadence tracking, added 2026-09-06 -- see run_status_report
  ├─ scoring.load_resume_profile()        # reads resume.md once for the whole cycle
  ├─ storage.get_unscored_jobs()          # SELECT ... WHERE fit_score IS NULL
  ├─ no unscored jobs? return                                    # added 2026-09-06
@@ -179,6 +185,8 @@ below for readability:
 
 ```
 run_apply_cycle(live)
+ ├─ storage.record_run("apply")   # cadence tracking, added 2026-09-06 -- see run_status_report;
+ │     recorded even if PAUSED/cap/preflight-decline below end up doing nothing this run
  ├─ if config.PAUSED: return                         # global kill switch, checked first
  ├─ effective_dry_run = config.DRY_RUN or not live
  │   # config.DRY_RUN=True  -> always a dry run, --live is irrelevant
@@ -431,8 +439,63 @@ run_status_report
  └─ storage.get_status_summary()   # a handful of read-only aggregate COUNT(*) queries:
         total jobs, unscored, scored, recommend_apply=True count,
         applied (real vs dry-run) counts, today's real-apply count,
-        apply_outcome value -> count (GROUP BY)
+        apply_outcome value -> count (GROUP BY), last_run_at (see below)
  └─ print(...)                     # plain stdout, not logged via `log`
+ └─ for cycle in (search, score, apply, check-status):
+        print(f"{cycle}: {_format_time_ago(...)}" or "never")
+```
+
+`get_status_summary()`'s `last_run_at` key is `storage.get_last_run_times()`
+— cadence/staleness tracking, added 2026-09-06 (see DECISIONS.md and
+JOB_SEARCH_STRATEGY.md roadmap item 5): `storage.record_run(cycle_name)`
+is called at the very start of `run_search_cycle`/`run_scoring_cycle`/
+`run_apply_cycle`/`run_check_status_cycle` (before any early-return path,
+so even a cycle that decides to do nothing — PAUSED, cap already
+reached, preflight declined — still counts as "you ran this recently"),
+appending one row to the `run_history` table. There was no existing
+timestamp for this before — `jobs.scraped_at`/`applied_at` are per-job,
+not per-cycle, and scoring had no timestamp column at all.
+
+## `run_check_status_cycle()` — orchestrator.py
+
+Added 2026-09-06 (see DECISIONS.md and JOB_SEARCH_STRATEGY.md's
+automation-roadmap item 1: outcome tracking). Entirely read-only against
+Naukri (a page view, not a write action) — not gated by `config.PAUSED`,
+same as `run_search_cycle()`/`run_scoring_cycle()`.
+
+```
+run_check_status_cycle
+ ├─ storage.record_run("check-status")   # cadence tracking, added 2026-09-06 -- see run_status_report
+ └─ naukri_client.get_application_status_history()
+     ├─ get_browser_context() + ensure_logged_in(page)
+     ├─ page.on("response", ...) registered BEFORE navigating, to capture
+     │     the history page's OWN natural API call
+     ├─ page.goto(".../myapply/historypage", wait_until="networkidle")
+     │   # that page's own JS calls .../applyapi/v5/history with an
+     │   # authorization: Bearer <JWT> + appid/systemid headers it
+     │   # attaches itself -- live-verified 2026-09-06: a hand-built
+     │   # context.request.get(...) or page.evaluate(fetch(...)) with just
+     │   # session cookies both get a 400. Captured via the response
+     │   # listener instead of reconstructed by hand -- see DECISIONS.md
+     ├─ no response captured -> log.warning(...), return []
+     ├─ matchingRowsCount > len(applyDetails)? -> log.warning("pagination
+     │     not implemented - older history is not being tracked")
+     └─ returns [{job_id, ars_score, is_open, statuses: [{status_id,
+           status_value, status_datetime}, ...]}, ...] -- entries missing
+           a job_id, or individual statuses missing a value/datetime, are
+           filtered out rather than stored malformed
+ └─ for each entry:
+     ├─ storage.record_application_status(job_id, ars_score, statuses)
+     │     -> INSERT OR IGNORE into application_status_history on
+     │        (job_id, status_id, status_datetime) -- re-recording an
+     │        already-seen status on a later check is a no-op, not a
+     │        duplicate row; also updates jobs.latest_apply_status and
+     │        jobs.naukri_ars_score to the most recent values
+     └─ log.info("Job %s: latest status = %s (Naukri ars_score=%s)", ...)
+ └─ storage.get_outcome_correlation()   # fit_score vs. latest_apply_status/
+        naukri_ars_score for every job with a recorded status, ordered by
+        fit_score desc -- the actual data this capability exists to produce
+ └─ print(...)                          # plain stdout, not logged via `log`
 ```
 
 ## Phase 3 (not started)

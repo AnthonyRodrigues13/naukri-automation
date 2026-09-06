@@ -212,6 +212,167 @@ class BackwardCompatWrapperTest(unittest.TestCase):
         self.assertEqual(result, details)
 
 
+class GetApplicationStatusHistoryTest(unittest.TestCase):
+    """Unit tests for naukri_client.get_application_status_history() --
+    outcome tracking, added 2026-09-06 (see DECISIONS.md). This captures
+    the response of the history page's OWN natural API call via
+    page.on("response", ...) rather than issuing a request directly (that
+    endpoint needs a bearer token + custom headers the page attaches
+    itself, live-verified not reproducible with just session cookies).
+    These tests simulate that response arriving during page.goto() by
+    invoking the registered handler from a fake goto() side effect --
+    Playwright itself is never touched.
+    """
+
+    def _fake_page_and_context(self, response_data=None, response_json_error=None):
+        page = MagicMock()
+        handlers = {}
+
+        def on(event, handler):
+            handlers[event] = handler
+
+        page.on.side_effect = on
+
+        if response_data is not None or response_json_error is not None:
+            fake_response = MagicMock()
+            fake_response.url = "https://www.naukri.com" + naukri_client.APPLICATION_HISTORY_API_MARKER + "?pageSize=50"
+            if response_json_error is not None:
+                fake_response.json.side_effect = response_json_error
+            else:
+                fake_response.json.return_value = response_data
+
+            def goto(url, **kwargs):
+                if "response" in handlers:
+                    handlers["response"](fake_response)
+
+            page.goto.side_effect = goto
+        # else: goto() does nothing -- simulates no response ever captured
+
+        fake_playwright = MagicMock()
+        fake_context = MagicMock()
+        fake_context.pages = [page]
+        return fake_playwright, fake_context
+
+    def _run(self, **kwargs):
+        fake_playwright, fake_context = self._fake_page_and_context(**kwargs)
+        with patch.object(
+            naukri_client, "get_browser_context", return_value=(fake_playwright, fake_context)
+        ), patch.object(naukri_client, "ensure_logged_in"), patch.object(naukri_client, "jittered_wait"):
+            result = naukri_client.get_application_status_history()
+        return result, fake_playwright, fake_context
+
+    def test_parses_applications_and_statuses_correctly(self):
+        response_data = {
+            "matchingRowsCount": "2",
+            "applyDetails": [
+                {
+                    "jobId": "123",
+                    "arsScore": 44,
+                    "isOpen": "true",
+                    "status": [
+                        {"statusId": 1, "statusValue": "Applied", "dateTime": "2026-09-01 10:00:00"},
+                        {"statusId": 2, "statusValue": "Application Sent", "dateTime": "2026-09-01 10:00:01"},
+                    ],
+                },
+                {
+                    "jobId": "456",
+                    "arsScore": 10,
+                    "isOpen": "false",
+                    "status": [{"statusId": 1, "statusValue": "Applied", "dateTime": "2026-09-02 09:00:00"}],
+                },
+            ],
+        }
+        result, fake_playwright, fake_context = self._run(response_data=response_data)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], {
+            "job_id": "123",
+            "ars_score": 44,
+            "is_open": True,
+            "statuses": [
+                {"status_id": 1, "status_value": "Applied", "status_datetime": "2026-09-01 10:00:00"},
+                {"status_id": 2, "status_value": "Application Sent", "status_datetime": "2026-09-01 10:00:01"},
+            ],
+        })
+        self.assertFalse(result[1]["is_open"])
+        fake_context.close.assert_called_once()
+        fake_playwright.stop.assert_called_once()
+
+    def test_warns_when_pagination_truncates_results(self):
+        response_data = {
+            "matchingRowsCount": "10",
+            "applyDetails": [
+                {
+                    "jobId": "1",
+                    "arsScore": 5,
+                    "isOpen": "true",
+                    "status": [{"statusId": 1, "statusValue": "Applied", "dateTime": "2026-09-01 10:00:00"}],
+                }
+            ],
+        }
+        with self.assertLogs(naukri_client.log, level="WARNING") as logs:
+            result, _, _ = self._run(response_data=response_data)
+        self.assertTrue(any("pagination not implemented" in m for m in logs.output))
+        self.assertEqual(len(result), 1)
+
+    def test_no_pagination_warning_when_all_rows_captured(self):
+        response_data = {
+            "matchingRowsCount": "1",
+            "applyDetails": [
+                {
+                    "jobId": "1",
+                    "arsScore": 5,
+                    "isOpen": "true",
+                    "status": [{"statusId": 1, "statusValue": "Applied", "dateTime": "2026-09-01 10:00:00"}],
+                }
+            ],
+        }
+        with patch.object(naukri_client.log, "warning") as mock_warning:
+            self._run(response_data=response_data)
+        self.assertFalse(any("pagination" in str(c.args) for c in mock_warning.call_args_list))
+
+    def test_no_response_captured_returns_empty_list_with_warning(self):
+        with self.assertLogs(naukri_client.log, level="WARNING") as logs:
+            result, fake_playwright, fake_context = self._run()  # goto() never fires a response
+        self.assertEqual(result, [])
+        self.assertTrue(any("no response captured" in m for m in logs.output))
+        fake_context.close.assert_called_once()
+        fake_playwright.stop.assert_called_once()
+
+    def test_entries_missing_job_id_are_skipped(self):
+        response_data = {
+            "matchingRowsCount": "1",
+            "applyDetails": [{"arsScore": 5, "isOpen": "true", "status": []}],
+        }
+        result, _, _ = self._run(response_data=response_data)
+        self.assertEqual(result, [])
+
+    def test_status_entries_missing_value_or_datetime_are_filtered_out(self):
+        response_data = {
+            "matchingRowsCount": "1",
+            "applyDetails": [
+                {
+                    "jobId": "1",
+                    "arsScore": 5,
+                    "isOpen": "true",
+                    "status": [
+                        {"statusId": 1, "statusValue": "Applied", "dateTime": "2026-09-01 10:00:00"},
+                        {"statusId": 2, "statusValue": None, "dateTime": "2026-09-01 10:00:01"},
+                        {"statusId": 3, "statusValue": "Shortlisted", "dateTime": None},
+                    ],
+                }
+            ],
+        }
+        result, _, _ = self._run(response_data=response_data)
+        self.assertEqual(len(result[0]["statuses"]), 1)
+        self.assertEqual(result[0]["statuses"][0]["status_value"], "Applied")
+
+    def test_context_closed_even_when_response_json_parse_fails(self):
+        result, fake_playwright, fake_context = self._run(response_json_error=ValueError("bad json"))
+        self.assertEqual(result, [])
+        fake_context.close.assert_called_once()
+        fake_playwright.stop.assert_called_once()
+
+
 class DecideChatbotTurnTest(unittest.TestCase):
     """Exhaustive coverage of naukri_client._decide_chatbot_turn() -- the
     actual bug-prone decision logic (chip/radio/text/file check ORDER,

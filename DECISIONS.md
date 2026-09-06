@@ -1550,3 +1550,114 @@ here when the fix is simply "wait for a real message," a low-cost delay
 compared to building on a wrong assumption and having to unwind it later.
 The API endpoint and wrapper shape are preserved in FLOW.md so this
 investigation doesn't need repeating whenever implementation resumes.
+
+---
+
+## 2026-09-06 — Outcome tracking implemented: Naukri's own application status, captured via response interception rather than a reconstructed API call
+
+**Decision:** Added `naukri_client.get_application_status_history()`,
+`storage.record_application_status()` /
+`storage.get_outcome_correlation()`, a new `application_status_history`
+table plus `jobs.latest_apply_status` / `jobs.naukri_ars_score` columns,
+`orchestrator.run_check_status_cycle()`, and a `check-status` CLI
+subcommand. This is item 1 from `JOB_SEARCH_STRATEGY.md`'s automation
+roadmap (the research pass done earlier this session) — the capability
+that turns the 70/100 `fit_score` threshold from an assumption into
+something measurable against what Naukri itself reports actually
+happened to a real application.
+
+**Context:** Live investigation (read-only — navigation and network
+observation only) found Naukri's own Application History page
+(`/myapply/historypage`) and the API it calls
+(`.../applyapi/v5/history`), which returns real per-application status
+history ("Applied", "Application Sent", and — per the page's own
+strings, not yet observed live — "Application Viewed" / "Shortlisted" /
+"Not Shortlisted" as a recruiter acts on it) plus Naukri's own `arsScore`
+per application. Unlike the Phase 3 inbox investigation (deferred, see
+the entry above), this one hit real, populated data immediately — all 6
+of this account's real applications came back with full status
+histories — so there was no blocker to implementing against a guess.
+
+**A real technical wrinkle, resolved:** the API requires an
+`authorization: Bearer <JWT>` header plus custom `appid`/`systemid`
+headers that the page's own JS attaches — confirmed by capturing the
+native request's headers. Two attempts at a direct call failed with 400:
+`context.request.get(...)` (shares session cookies with the browser
+context, but not this bearer token) and a manual `fetch()` run via
+`page.evaluate` from within the page's own JS context (same origin, same
+cookies, still 400 — whatever attaches this header isn't a plain global
+`fetch` wrapper). Rather than extracting and holding a real bearer
+credential by hand to replicate the request, the function instead
+navigates to the page normally and captures the response of the page's
+OWN natural call via `page.on("response", ...)` — the same
+non-reconstructive pattern this module already uses everywhere else, and
+notably safer: no bearer token is ever extracted, stored, or logged
+anywhere in this codebase.
+
+**Alternatives considered:**
+- Reconstruct the API request by hand with the captured bearer token —
+  rejected: the token is short-lived (a JWT `exp` claim, observed
+  ~1 hour), so a hand-built request would need constant re-extraction
+  anyway, and holding a real auth credential in this codebase — even
+  transiently — is a meaningfully bigger blast radius than a page view if
+  anything ever logged or leaked it. The response-capture approach never
+  touches the token at all.
+- Fetch every page of history (pagination) in this first pass — deferred;
+  only 6 applications exist right now, comfortably fitting the page's own
+  default view. Implemented a loud warning instead
+  (`matchingRowsCount > len(applyDetails)`) so growth past one page is
+  visible, not silently dropped — matches this project's "no silent caps"
+  convention.
+- Store only the latest status per job, not a full history table —
+  rejected: the append-only `application_status_history` table is what
+  lets a FUTURE analysis ask "how long did each status take" or "which
+  jobs got Shortlisted vs Not Shortlisted", not just "what's the current
+  state" — cheap to keep now, expensive to reconstruct later if only the
+  latest value had been kept.
+
+**Tradeoff:** None significant — this is a new, additive, read-only
+capability. `naukri_ars_score`'s exact meaning (an internal Naukri
+relevance metric, exposed but not documented) is inferred from context,
+not confirmed by any official source — treat comparisons against
+`fit_score` as suggestive, not a validated ground truth, until enough
+real outcomes accumulate to say more.
+
+---
+
+## 2026-09-06 — Cadence/staleness tracking added to `status` (roadmap item 5)
+
+**Decision:** Added a `run_history` table (one row per cycle
+invocation), `storage.record_run(cycle_name)` / `get_last_run_times()`,
+and a `_format_time_ago()` presentation helper in `orchestrator.py`.
+`storage.record_run(...)` is called at the very start of
+`run_search_cycle`/`run_scoring_cycle`/`run_apply_cycle`/
+`run_check_status_cycle` — before any early-return path — so a cycle that
+decides to do nothing (`PAUSED`, daily cap already reached, pre-flight
+declined) still counts as "you ran this recently." `run_status_report()`
+now prints a "Last run" section for all four cycles ("3 days ago" /
+"never").
+
+**Context:** `JOB_SEARCH_STRATEGY.md`'s automation-roadmap item 5 — using
+data the tool already has, in spirit, though in practice there was no
+existing per-cycle timestamp to reuse: `jobs.scraped_at`/`applied_at` are
+per-JOB, not per-cycle (a job scraped 2 weeks ago says nothing about
+whether `search` was run again since), and scoring had no timestamp
+column at all. A small dedicated table was the only way to actually
+answer "when did I last run each cycle."
+
+**Alternatives considered:**
+- Derive "last search" from `MAX(jobs.scraped_at)` instead of a new
+  table — rejected: this only tells you when the last NEW job was
+  scraped, not when `search` was last invoked. A `search` run that skips
+  every result because they're all already known (see the
+  skip-already-known-jobs quick win) would look identical to "never run"
+  under this proxy, which is exactly backwards.
+- Record the run only on successful completion, not at the very start —
+  rejected: the point of staleness tracking is "how long since you last
+  attempted this," and a cycle that ran but decided to do nothing (e.g.
+  `PAUSED` is set) still represents a real, recent interaction with the
+  tool — arguably more useful to know about than a silent success would
+  be.
+
+**Tradeoff:** None significant — small, purely additive, zero new safety
+surface (this table only records that a cycle ran, never what it did).

@@ -76,12 +76,28 @@ code reads. The same outcome is also persisted to `jobs.db`'s
 `apply_outcome` column for every attempt, queryable without opening Excel.
 
 For a quick read-only summary — how many jobs are scored, how many have
-been applied to (real vs. dry-run), and a breakdown of apply outcomes —
-without hand-written SQL:
+been applied to (real vs. dry-run), a breakdown of apply outcomes, and
+how long it's been since you last ran each cycle (`search`/`score`/
+`apply`/`check-status`) — without hand-written SQL:
 
 ```
 python orchestrator.py status
 ```
+
+To check what actually happened to real applications after submission —
+Naukri's own status (Applied / Application Sent / Shortlisted / Not
+Shortlisted, as recruiters act on them) and its own relevance score,
+correlated against this tool's `fit_score` — run:
+
+```
+python orchestrator.py check-status
+```
+
+This is read-only (a page view, not a write action) and only covers
+whatever Naukri's Application History page shows on its default view; if
+your real application count grows past one page, older history stops
+being tracked until pagination support is added (a warning is logged when
+this happens, not silently dropped).
 
 ## Safety notes
 

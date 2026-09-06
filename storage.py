@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     dry_run INTEGER,
     scraped_at TEXT,
     external_apply_url TEXT,
-    apply_outcome TEXT
+    apply_outcome TEXT,
+    latest_apply_status TEXT,
+    naukri_ars_score INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -35,6 +37,32 @@ CREATE TABLE IF NOT EXISTS messages (
     draft_reply TEXT,
     sent INTEGER DEFAULT 0,
     sent_at TEXT
+);
+
+-- Append-only log of every distinct application-status entry observed on
+-- Naukri's own Application History page. Added 2026-09-06 for outcome
+-- tracking (see DECISIONS.md and JOB_SEARCH_STRATEGY.md) -- the primary
+-- key on (job_id, status_id, status_datetime) makes re-recording an
+-- already-seen status a no-op (INSERT OR IGNORE), so repeated checks
+-- accumulate only genuinely NEW status transitions, never duplicates.
+CREATE TABLE IF NOT EXISTS application_status_history (
+    job_id TEXT,
+    status_id INTEGER,
+    status_value TEXT,
+    status_datetime TEXT,
+    recorded_at TEXT,
+    PRIMARY KEY (job_id, status_id, status_datetime)
+);
+
+-- One row per cycle invocation (search/score/apply/check-status), added
+-- 2026-09-06 for cadence/staleness tracking in `status` (see DECISIONS.md
+-- and JOB_SEARCH_STRATEGY.md roadmap item 5) -- there was no existing
+-- timestamp for "when was this cycle last run" (jobs.scraped_at/applied_at
+-- are per-job, not per-cycle, and scoring has no timestamp column at all).
+CREATE TABLE IF NOT EXISTS run_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle TEXT NOT NULL,
+    ran_at TEXT NOT NULL
 );
 """
 
@@ -62,6 +90,10 @@ def init_db():
             conn.execute("ALTER TABLE jobs ADD COLUMN external_apply_url TEXT")
         if "apply_outcome" not in existing_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN apply_outcome TEXT")
+        if "latest_apply_status" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN latest_apply_status TEXT")
+        if "naukri_ars_score" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN naukri_ars_score INTEGER")
 
 
 def upsert_job(job: dict):
@@ -122,6 +154,53 @@ def mark_applied(job_id: str, dry_run: bool):
         )
 
 
+def record_application_status(job_id: str, ars_score, statuses: list[dict]):
+    """Outcome tracking, added 2026-09-06 (see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md) -- records Naukri's own view of what happened
+    to a real application after it was submitted. `statuses` is
+    [{"status_id", "status_value", "status_datetime"}, ...] as returned by
+    naukri_client.get_application_status_history(). Every entry is
+    appended to application_status_history (INSERT OR IGNORE on the
+    (job_id, status_id, status_datetime) primary key, so re-recording an
+    already-seen status on a later check is a no-op, not a duplicate row).
+    jobs.latest_apply_status and jobs.naukri_ars_score are also updated to
+    the most recent values, so the fit_score-vs-outcome correlation this
+    capability exists to enable (see get_outcome_correlation) is a plain
+    query, not a join across every historical status row. Does nothing if
+    `statuses` is empty (a job with no recorded status yet)."""
+    if not statuses:
+        return
+    with _connect() as conn:
+        now = datetime.now().isoformat()
+        for s in statuses:
+            conn.execute(
+                "INSERT OR IGNORE INTO application_status_history "
+                "(job_id, status_id, status_value, status_datetime, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (job_id, s["status_id"], s["status_value"], s["status_datetime"], now),
+            )
+        latest = max(statuses, key=lambda s: s["status_datetime"])
+        conn.execute(
+            "UPDATE jobs SET latest_apply_status = ?, naukri_ars_score = ? WHERE job_id = ?",
+            (latest["status_value"], ars_score, job_id),
+        )
+
+
+def get_outcome_correlation() -> list[dict]:
+    """fit_score vs. Naukri's own latest_apply_status/naukri_ars_score for
+    every job with a recorded status -- the actual data outcome tracking
+    exists to produce (see JOB_SEARCH_STRATEGY.md's automation roadmap,
+    item 1: this is what would let the 70/100 fit_score threshold be
+    measured against real recruiter response instead of assumed).
+    Added 2026-09-06."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT job_id, title, company, fit_score, naukri_ars_score, latest_apply_status "
+            "FROM jobs WHERE latest_apply_status IS NOT NULL ORDER BY fit_score DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def count_applications_today() -> int:
     """Counts only real (non-dry-run) applications. Dry-run attempts are
     still logged via mark_applied() for audit visibility, but must never
@@ -169,7 +248,29 @@ def get_status_summary() -> dict:
         "applied_today": count_applications_today(),
         "daily_cap": config.DAILY_APPLICATION_CAP,
         "apply_outcomes": {r["apply_outcome"]: r["n"] for r in outcome_rows},
+        "last_run_at": get_last_run_times(),
     }
+
+
+def record_run(cycle: str):
+    """Appends one row to run_history recording that `cycle` (e.g.
+    "search", "score", "apply", "check-status") ran now. Added 2026-09-06
+    for cadence/staleness tracking — see get_last_run_times() and
+    get_status_summary()."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO run_history (cycle, ran_at) VALUES (?, ?)",
+            (cycle, datetime.now().isoformat()),
+        )
+
+
+def get_last_run_times() -> dict:
+    """Most recent ran_at timestamp per cycle name, e.g.
+    {"search": "2026-09-06T...", "score": "..."}. A cycle never run yet is
+    simply absent from the returned dict. Added 2026-09-06."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT cycle, MAX(ran_at) AS last_ran FROM run_history GROUP BY cycle").fetchall()
+        return {r["cycle"]: r["last_ran"] for r in rows}
 
 
 def get_applicable_jobs(min_fit_score: int) -> list[dict]:
