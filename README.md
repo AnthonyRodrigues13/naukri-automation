@@ -72,7 +72,16 @@ Every apply attempt — dry-run or real, successful or not — gets a row in
 score/reason, outcome, the full question-and-answer transcript from the
 screening chatbot (if any), and whether it was a dry run. Open it directly
 in Excel; it's a human-readable companion to `jobs.db`, not something other
-code reads.
+code reads. The same outcome is also persisted to `jobs.db`'s
+`apply_outcome` column for every attempt, queryable without opening Excel.
+
+For a quick read-only summary — how many jobs are scored, how many have
+been applied to (real vs. dry-run), and a breakdown of apply outcomes —
+without hand-written SQL:
+
+```
+python orchestrator.py status
+```
 
 ## Safety notes
 

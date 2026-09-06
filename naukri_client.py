@@ -7,6 +7,7 @@ import logging
 import random
 import time
 from pathlib import Path
+from typing import TypedDict
 
 from playwright.sync_api import Page, sync_playwright
 
@@ -91,6 +92,45 @@ CHATBOT_SEND_BUTTON_SELECTOR = "[id^='sendMsg_']:not(.disabled) .sendMsg"
 CHATBOT_APPLIED_BANNER_SELECTOR = "text=/Applied to/i"
 
 MAX_CHATBOT_TURNS = 6
+
+
+class ApplyResult(TypedDict):
+    """Return shape shared by apply_to_job() and _handle_screening_chatbot()
+    (the latter's return value IS one of the former's, in the branch that
+    hands off to it directly) — added 2026-09-06, see DECISIONS.md. Every
+    return path in both functions is built via _apply_result() below, so
+    all four keys are always present; previously only "qa_log" was
+    guaranteed everywhere and "external_url" appeared in just 1 of
+    apply_to_job()'s 9 return statements.
+
+    "applied" is True only for an actual, real submission — DRY_RUN always
+    returns False with reason="dry_run" even though that's the expected
+    outcome; callers key off `reason`, not just `applied`, to decide what
+    counts as an attempt for audit logging.
+    "qa_log" is a list of {"question", "answer", "options"} dicts, [] when
+    the screening chatbot was never reached.
+    "external_url" is None except for reason="external_apply_not_supported"
+    with config.CAPTURE_EXTERNAL_APPLY_URLS True — every other path leaves
+    it None, but the key itself is always present so callers can index it
+    uniformly instead of needing .get().
+    """
+
+    applied: bool
+    reason: str
+    qa_log: list
+    external_url: str | None
+
+
+def _apply_result(applied: bool, reason: str, qa_log: list | None = None, external_url: str | None = None) -> ApplyResult:
+    """The ONE place every apply_to_job()/_handle_screening_chatbot() return
+    value is built — see ApplyResult. qa_log defaults to a FRESH empty
+    list per call (never a shared mutable default)."""
+    return {
+        "applied": applied,
+        "reason": reason,
+        "qa_log": qa_log if qa_log is not None else [],
+        "external_url": external_url,
+    }
 
 
 def jittered_wait():
@@ -204,6 +244,16 @@ def _scrape_job_details(page: Page, job_url: str) -> dict:
     description = ""
     if page.locator(JOB_DESCRIPTION_SELECTOR).first.count():
         description = page.locator(JOB_DESCRIPTION_SELECTOR).first.inner_text().strip()
+    else:
+        # JOB_DESCRIPTION_SELECTOR is a CSS-module hash that's already
+        # broken once before (see the comment on the selector itself) --
+        # log every occurrence so a fresh break is visible immediately
+        # instead of only showing up later as a cluster of empty
+        # descriptions / fit_score=0 rows in jobs.db with no obvious cause.
+        log.warning(
+            "Job %s: description selector matched nothing - job will have an empty description.",
+            _job_id_from_url(job_url),
+        )
 
     meta = ""
     if page.locator(JOB_META_SELECTOR).first.count():
@@ -247,7 +297,9 @@ def get_job_details(job_url: str) -> dict:
         playwright.stop()
 
 
-def search_jobs_with_details(keywords: str, location: str = "", max_pages: int = 1) -> list[dict]:
+def search_jobs_with_details(
+    keywords: str, location: str = "", max_pages: int = 1, skip_job_ids: set | None = None
+) -> list[dict]:
     """Combines search_jobs() + a get_job_details() call per result into a
     SINGLE browser session: one context/page opened once, one
     ensure_logged_in() call, reused for the search-results scrape AND every
@@ -257,6 +309,19 @@ def search_jobs_with_details(keywords: str, location: str = "", max_pages: int =
     called directly on each result with no merging at the call site (`meta`
     is deliberately dropped, matching the old call site's behavior, which
     only ever pulled `description` out of get_job_details()'s return value).
+
+    `skip_job_ids`, if given, is a set of job_ids to skip the detail fetch
+    for entirely -- added 2026-09-06 so run_search_cycle() can pass in
+    every job_id that already has a stored, non-empty description
+    (storage.get_job_ids_with_description()), avoiding a pointless re-fetch
+    of a job already known from a prior search. This module never imports
+    storage directly (see FLOW.md's module-boundary rule) -- the caller
+    supplies the set instead, the same pattern already used for
+    `answer_fn`. A skipped job's result dict has NO "description" key at
+    all (not an empty string) -- storage.upsert_job() only SETs the keys
+    present in the dict it's given, so omitting the key entirely means the
+    existing stored description is left untouched, not overwritten with
+    an empty one.
 
     Added 2026-09-05 to fix a known inefficiency documented in FLOW.md:
     the old per-job get_job_details() call opened a fresh
@@ -286,8 +351,20 @@ def search_jobs_with_details(keywords: str, location: str = "", max_pages: int =
         ensure_logged_in(page)
 
         jobs = _scrape_search_results(page, keywords, location, max_pages)
+        empty_description_count = 0
+        skip_job_ids = skip_job_ids or set()
 
         for idx, job in enumerate(jobs, start=1):
+            if job["job_id"] in skip_job_ids:
+                log.info(
+                    "Job %d/%d: %s already has a stored description, skipping detail fetch.",
+                    idx,
+                    len(jobs),
+                    job["job_id"],
+                )
+                results.append(dict(job))  # no "description" key -- see docstring
+                continue
+
             try:
                 details = _scrape_job_details(page, job["url"])
                 description = details.get("description", "")
@@ -300,6 +377,8 @@ def search_jobs_with_details(keywords: str, location: str = "", max_pages: int =
                     exc_info=True,
                 )
                 description = ""
+            if not description:
+                empty_description_count += 1
             results.append({**job, "description": description})
             # With the whole loop now inside this function (see the docstring
             # above), the caller gets nothing back until every job is done --
@@ -308,6 +387,20 @@ def search_jobs_with_details(keywords: str, location: str = "", max_pages: int =
             # instead so a run in progress is still visible, not silent until
             # the very end.
             log.info("Fetched details for job %d/%d: %s (%s)", idx, len(jobs), job["job_id"], job.get("title", ""))
+
+        if empty_description_count:
+            # A cluster of these in one run is the visible symptom of a
+            # broken JOB_DESCRIPTION_SELECTOR (or a genuine wave of dead
+            # links) -- surfaced here as one clear summary line instead of
+            # only being discoverable later by noticing several fit_score=0
+            # rows in jobs.db with no obvious shared cause.
+            log.warning(
+                "%d/%d job(s) had an empty description this run - if that's "
+                "unexpected, JOB_DESCRIPTION_SELECTOR may need re-verifying "
+                "against a live job page.",
+                empty_description_count,
+                len(jobs),
+            )
     finally:
         context.close()
         playwright.stop()
@@ -557,7 +650,7 @@ _MANUAL_REVIEW_LOG_MESSAGES = {
 }
 
 
-def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
+def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> ApplyResult:
     """Walks Naukri's screening-question chatbot turn by turn. Only called
     when config.AUTO_ANSWER_SCREENING_QUESTIONS is True (checked by the
     caller). `answer_fn(question: str, options: list[str] | None) -> str |
@@ -593,11 +686,11 @@ def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
 
         if action_type == "applied":
             log.info("Job %s: chatbot flow completed, application submitted.", job_id)
-            return {"applied": True, "reason": "applied", "qa_log": qa_log}
+            return _apply_result(True, "applied", qa_log=qa_log)
 
         if action_type == "no_messages":
             log.warning("Job %s: chatbot has no messages, can't determine the question.", job_id)
-            return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
+            return _apply_result(False, "chatbot_state_unrecognized_manual_review", qa_log=qa_log)
 
         if action_type == "click_chip":
             page.locator(CHATBOT_CHIP_SELECTOR).nth(action["index"]).click()
@@ -622,13 +715,13 @@ def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
                 log_args = (job_id, state["question"])
             log.warning(_MANUAL_REVIEW_LOG_MESSAGES[action["detail"]], *log_args)
             qa_log.append(action["qa_entry"])
-            return {"applied": False, "reason": action["reason"], "qa_log": qa_log}
+            return _apply_result(False, action["reason"], qa_log=qa_log)
 
         if action_type == "select_radio":
             _select_radio_option(page, page.locator(CHATBOT_RADIO_SELECTOR).nth(action["index"]))
             qa_log.append(action["qa_entry"])
             if not _click_send_button(page, job_id):
-                return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
+                return _apply_result(False, "chatbot_state_unrecognized_manual_review", qa_log=qa_log)
             continue
 
         if action_type == "fill_text":
@@ -636,7 +729,7 @@ def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
             jittered_wait()
             qa_log.append(action["qa_entry"])
             if not _click_send_button(page, job_id):
-                return {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": qa_log}
+                return _apply_result(False, "chatbot_state_unrecognized_manual_review", qa_log=qa_log)
             continue
 
         if action_type == "attempt_resume_upload":
@@ -656,14 +749,14 @@ def _handle_screening_chatbot(page: Page, job_id: str, answer_fn) -> dict:
             if page.locator("text=/file upload was unsuccessful/i").count() > 0:
                 log.warning("Job %s: resume upload rejected by Naukri - manual review.", job_id)
                 qa_log.append({"question": state["question"], "answer": "(upload failed)", "options": None})
-                return {"applied": False, "reason": "resume_upload_failed_manual_review", "qa_log": qa_log}
+                return _apply_result(False, "resume_upload_failed_manual_review", qa_log=qa_log)
             qa_log.append({"question": state["question"], "answer": "(uploaded resume)", "options": None})
             continue
 
         raise AssertionError(f"unreachable: unknown chatbot action type {action_type!r}")
 
     log.warning("Job %s: chatbot exceeded %d turns - manual review.", job_id, MAX_CHATBOT_TURNS)
-    return {"applied": False, "reason": "questionnaire_too_long_manual_review", "qa_log": qa_log}
+    return _apply_result(False, "questionnaire_too_long_manual_review", qa_log=qa_log)
 
 
 def _capture_external_apply_url(page: Page, context, job_id: str) -> str | None:
@@ -703,19 +796,11 @@ def _capture_external_apply_url(page: Page, context, job_id: str) -> str | None:
         return None
 
 
-def apply_to_job(job_id: str, job_url: str, answer_fn=None) -> dict:
-    """Returns {"applied": bool, "reason": str, "qa_log": list,
-    "external_url": str | None}. "external_url" is only ever set for
-    reason="external_apply_not_supported" — every other path either never
-    reaches an external-apply button or returns None for it via .get()
-    (not added as an explicit key everywhere, unlike qa_log, since it's
-    only ever meaningful in that one branch). "applied" is
-    only ever True for an actual, real submission — DRY_RUN always returns
-    False with reason="dry_run" even though that's the expected/successful
-    dry-run outcome; callers (orchestrator.run_apply_cycle) key off `reason`,
-    not just `applied`, to decide what counts as an attempt for audit
-    logging. "qa_log" is always present (empty list when the chatbot was
-    never reached) — consumed by excel_log.log_application().
+def apply_to_job(job_id: str, job_url: str, answer_fn=None) -> ApplyResult:
+    """Returns an ApplyResult (see that class) — every return path below is
+    built via _apply_result() so all four keys are always present, added
+    2026-09-06 (see DECISIONS.md; previously "external_url" appeared in
+    just 1 of this function's 9 return statements).
 
     `answer_fn`, if given, is passed straight to _handle_screening_chatbot
     and is only ever invoked when config.AUTO_ANSWER_SCREENING_QUESTIONS is
@@ -729,11 +814,11 @@ def apply_to_job(job_id: str, job_url: str, answer_fn=None) -> dict:
     recoverable by hand; a wrong click on someone's behalf is not."""
     if config.PAUSED:
         log.warning("PAUSED is set — skipping apply_to_job(%s).", job_id)
-        return {"applied": False, "reason": "paused", "qa_log": []}
+        return _apply_result(False, "paused")
 
     if config.DRY_RUN:
         log.info("[DRY RUN] would apply to job %s (%s)", job_id, job_url)
-        return {"applied": False, "reason": "dry_run", "qa_log": []}
+        return _apply_result(False, "dry_run")
 
     log.warning("[LIVE] Applying for real to job %s (%s) - DRY_RUN is False.", job_id, job_url)
 
@@ -754,19 +839,14 @@ def apply_to_job(job_id: str, job_url: str, answer_fn=None) -> dict:
                     log.info("Job %s is external-apply-only. Captured URL: %s", job_id, external_url)
                 else:
                     log.info("Job %s is external-apply-only, skipping (not clicked).", job_id)
-                return {
-                    "applied": False,
-                    "reason": "external_apply_not_supported",
-                    "qa_log": [],
-                    "external_url": external_url,
-                }
+                return _apply_result(False, "external_apply_not_supported", external_url=external_url)
             log.warning("No Apply button found for job %s.", job_id)
-            return {"applied": False, "reason": "apply_button_not_found", "qa_log": []}
+            return _apply_result(False, "apply_button_not_found")
 
         btn_text = apply_btn.inner_text().strip().lower()
         if "applied" in btn_text:
             log.info("Job %s already shows Applied.", job_id)
-            return {"applied": False, "reason": "already_applied", "qa_log": []}
+            return _apply_result(False, "already_applied")
 
         apply_btn.click()
         jittered_wait()
@@ -779,18 +859,18 @@ def apply_to_job(job_id: str, job_url: str, answer_fn=None) -> dict:
                 "leaving it for manual review, not answering on your behalf.",
                 job_id,
             )
-            return {"applied": False, "reason": "questionnaire_required_manual_review", "qa_log": []}
+            return _apply_result(False, "questionnaire_required_manual_review")
 
         post_click_text = page.locator(APPLY_BUTTON_SELECTOR).first
         if post_click_text.count() and "applied" in post_click_text.inner_text().strip().lower():
             log.info("Applied to job %s.", job_id)
-            return {"applied": True, "reason": "applied", "qa_log": []}
+            return _apply_result(True, "applied")
 
         log.warning(
             "Job %s: clicked Apply but couldn't confirm success — needs manual review.",
             job_id,
         )
-        return {"applied": False, "reason": "apply_outcome_unclear_manual_review", "qa_log": []}
+        return _apply_result(False, "apply_outcome_unclear_manual_review")
     finally:
         context.close()
         playwright.stop()

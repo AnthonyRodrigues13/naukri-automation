@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     applied_at TEXT,
     dry_run INTEGER,
     scraped_at TEXT,
-    external_apply_url TEXT
+    external_apply_url TEXT,
+    apply_outcome TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -59,6 +60,8 @@ def init_db():
         existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         if "external_apply_url" not in existing_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN external_apply_url TEXT")
+        if "apply_outcome" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN apply_outcome TEXT")
 
 
 def upsert_job(job: dict):
@@ -99,6 +102,18 @@ def get_unscored_jobs() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_job_ids_with_description() -> set[str]:
+    """job_ids that already have a stored, non-empty description. Added
+    2026-09-06 so run_search_cycle() can pass this to
+    naukri_client.search_jobs_with_details(skip_job_ids=...) and skip
+    re-fetching details for a job already known from a prior search."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT job_id FROM jobs WHERE description IS NOT NULL AND description != ''"
+        ).fetchall()
+        return {r["job_id"] for r in rows}
+
+
 def mark_applied(job_id: str, dry_run: bool):
     with _connect() as conn:
         conn.execute(
@@ -120,6 +135,41 @@ def count_applications_today() -> int:
             (f"{today}%",),
         ).fetchone()
         return row["n"]
+
+
+def get_status_summary() -> dict:
+    """Read-only aggregate counts for the `status` CLI subcommand — added
+    2026-09-06 so "how did the last run go" doesn't require hand-written
+    SQL (the gap README's own documented `sqlite3 "select ..."` one-liner
+    pointed at). Nothing here writes anything."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) n FROM jobs").fetchone()["n"]
+        unscored = conn.execute("SELECT COUNT(*) n FROM jobs WHERE fit_score IS NULL").fetchone()["n"]
+        recommend_apply_true = conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE recommend_apply = 1"
+        ).fetchone()["n"]
+        applied_real = conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE applied = 1 AND dry_run = 0"
+        ).fetchone()["n"]
+        applied_dry_run = conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE applied = 1 AND dry_run = 1"
+        ).fetchone()["n"]
+        outcome_rows = conn.execute(
+            "SELECT apply_outcome, COUNT(*) AS n FROM jobs WHERE apply_outcome IS NOT NULL "
+            "GROUP BY apply_outcome ORDER BY n DESC"
+        ).fetchall()
+
+    return {
+        "total_jobs": total,
+        "unscored": unscored,
+        "scored": total - unscored,
+        "recommend_apply_true": recommend_apply_true,
+        "applied_real": applied_real,
+        "applied_dry_run": applied_dry_run,
+        "applied_today": count_applications_today(),
+        "daily_cap": config.DAILY_APPLICATION_CAP,
+        "apply_outcomes": {r["apply_outcome"]: r["n"] for r in outcome_rows},
+    }
 
 
 def get_applicable_jobs(min_fit_score: int) -> list[dict]:

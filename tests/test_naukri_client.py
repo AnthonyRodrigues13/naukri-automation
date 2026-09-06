@@ -94,6 +94,64 @@ class SearchJobsWithDetailsTest(unittest.TestCase):
         self.assertEqual(results[1]["job_id"], FAKE_JOBS[1]["job_id"])  # search-card info preserved
         self.assertEqual(results[2]["description"], f"desc for {FAKE_JOBS[2]['url']}")
 
+    def test_empty_description_summary_logged_when_any_job_has_one(self):
+        def fake_scrape_details(page, url):
+            if url == FAKE_JOBS[1]["url"]:
+                return {"job_id": "x", "url": url, "description": "", "meta": ""}
+            return {"job_id": "x", "url": url, "description": f"desc for {url}", "meta": ""}
+
+        with patch.object(
+            naukri_client, "get_browser_context", side_effect=_fake_browser_context
+        ), patch.object(naukri_client, "ensure_logged_in"), patch.object(
+            naukri_client, "_scrape_search_results", return_value=list(FAKE_JOBS)
+        ), patch.object(naukri_client, "_scrape_job_details", side_effect=fake_scrape_details):
+            with self.assertLogs(naukri_client.log, level="WARNING") as logs:
+                naukri_client.search_jobs_with_details("python developer")
+
+        self.assertTrue(any("1/3 job(s) had an empty description" in m for m in logs.output))
+
+    def test_no_empty_description_summary_when_all_have_content(self):
+        with patch.object(
+            naukri_client, "get_browser_context", side_effect=_fake_browser_context
+        ), patch.object(naukri_client, "ensure_logged_in"), patch.object(
+            naukri_client, "_scrape_search_results", return_value=list(FAKE_JOBS)
+        ), patch.object(
+            naukri_client,
+            "_scrape_job_details",
+            side_effect=lambda page, url: {"job_id": "x", "url": url, "description": "content", "meta": ""},
+        ):
+            with patch.object(naukri_client.log, "warning") as mock_warning:
+                naukri_client.search_jobs_with_details("python developer")
+
+        self.assertFalse(
+            any("empty description" in str(call.args) for call in mock_warning.call_args_list)
+        )
+
+    def test_skip_job_ids_skips_detail_fetch_and_omits_description_key(self):
+        # Added 2026-09-06: a job already known (stored, non-empty
+        # description) shouldn't have its detail fetch re-run, and its
+        # result dict must have NO "description" key at all -- not an
+        # empty string, which storage.upsert_job() would treat as "set
+        # description to empty", overwriting the real stored value.
+        with patch.object(
+            naukri_client, "get_browser_context", side_effect=_fake_browser_context
+        ), patch.object(naukri_client, "ensure_logged_in"), patch.object(
+            naukri_client, "_scrape_search_results", return_value=list(FAKE_JOBS)
+        ), patch.object(
+            naukri_client,
+            "_scrape_job_details",
+            side_effect=lambda page, url: {"job_id": "x", "url": url, "description": f"desc for {url}", "meta": ""},
+        ) as mock_scrape_details:
+            results = naukri_client.search_jobs_with_details(
+                "python developer", skip_job_ids={FAKE_JOBS[1]["job_id"]}
+            )
+
+        self.assertEqual(mock_scrape_details.call_count, 2)  # only the two NOT skipped
+        self.assertNotIn("description", results[1])  # skipped job: key omitted entirely
+        self.assertEqual(results[1]["job_id"], FAKE_JOBS[1]["job_id"])  # search-card info still present
+        self.assertEqual(results[0]["description"], f"desc for {FAKE_JOBS[0]['url']}")
+        self.assertEqual(results[2]["description"], f"desc for {FAKE_JOBS[2]['url']}")
+
     def test_context_closed_after_normal_completion(self):
         fake_playwright, fake_context = _fake_browser_context()
         with patch.object(
@@ -366,7 +424,7 @@ class HandleScreeningChatbotDispatchTest(unittest.TestCase):
             naukri_client, "_read_chatbot_turn_state", return_value={"question": "q"}
         ), patch.object(naukri_client, "_decide_chatbot_turn", return_value={"type": "applied"}):
             result = naukri_client._handle_screening_chatbot(page, "job1", answer_fn=lambda q, o: None)
-        self.assertEqual(result, {"applied": True, "reason": "applied", "qa_log": []})
+        self.assertEqual(result, {"applied": True, "reason": "applied", "qa_log": [], "external_url": None})
 
     def test_no_messages_action_ends_the_walk_for_manual_review(self):
         page = MagicMock()
@@ -414,7 +472,13 @@ class HandleScreeningChatbotDispatchTest(unittest.TestCase):
         ), patch.object(naukri_client, "_decide_chatbot_turn", return_value=action):
             result = naukri_client._handle_screening_chatbot(page, "job1", answer_fn=lambda q, o: None)
         self.assertEqual(
-            result, {"applied": False, "reason": "chatbot_state_unrecognized_manual_review", "qa_log": [qa_entry]}
+            result,
+            {
+                "applied": False,
+                "reason": "chatbot_state_unrecognized_manual_review",
+                "qa_log": [qa_entry],
+                "external_url": None,
+            },
         )
 
     def test_manual_review_no_answer_case_logs_without_raising(self):
@@ -552,6 +616,31 @@ class HandleScreeningChatbotDispatchTest(unittest.TestCase):
             result = naukri_client._handle_screening_chatbot(page, "job1", answer_fn=lambda q, o: None)
         self.assertEqual(result["reason"], "questionnaire_too_long_manual_review")
         self.assertEqual(len(result["qa_log"]), naukri_client.MAX_CHATBOT_TURNS)
+
+
+class ApplyResultBuilderTest(unittest.TestCase):
+    """Added 2026-09-06 (see DECISIONS.md): _apply_result() is now the ONE
+    place every apply_to_job()/_handle_screening_chatbot() return value is
+    built, so all four keys are always present -- previously "external_url"
+    appeared in just 1 of apply_to_job()'s 9 return statements."""
+
+    def test_all_four_keys_always_present_with_defaults(self):
+        result = naukri_client._apply_result(False, "some_reason")
+        self.assertEqual(result, {"applied": False, "reason": "some_reason", "qa_log": [], "external_url": None})
+
+    def test_qa_log_default_is_a_fresh_list_each_call_not_a_shared_mutable_default(self):
+        result1 = naukri_client._apply_result(False, "reason1")
+        result1["qa_log"].append({"question": "q", "answer": "a", "options": None})
+        result2 = naukri_client._apply_result(False, "reason2")
+        self.assertEqual(result2["qa_log"], [])  # unaffected by mutating result1's list
+
+    def test_explicit_qa_log_and_external_url_passed_through(self):
+        qa_log = [{"question": "q", "answer": "a", "options": None}]
+        result = naukri_client._apply_result(True, "applied", qa_log=qa_log, external_url="https://example.com")
+        self.assertEqual(
+            result,
+            {"applied": True, "reason": "applied", "qa_log": qa_log, "external_url": "https://example.com"},
+        )
 
 
 if __name__ == "__main__":

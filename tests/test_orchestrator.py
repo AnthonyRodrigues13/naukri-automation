@@ -25,6 +25,7 @@ import config
 import excel_log
 import naukri_client
 import orchestrator
+import scoring
 import storage
 
 FAKE_JOB = {
@@ -78,6 +79,8 @@ class RunApplyCycleLiveFlagTest(unittest.TestCase):
         ), patch.object(naukri_client, "apply_to_job", side_effect=fake_apply_to_job), patch.object(
             excel_log, "log_application"
         ) as mock_log_application, patch.object(storage, "mark_applied") as mock_mark_applied, patch.object(
+            storage, "upsert_job"
+        ), patch.object(
             orchestrator, "_preflight_summary_and_confirm", return_value=True
         ), patch.object(
             orchestrator, "_confirm_after_apply_streak", return_value=True
@@ -153,6 +156,8 @@ class PreflightConfirmationTest(unittest.TestCase):
         ), patch.object(
             naukri_client, "apply_to_job", return_value={"applied": False, "reason": "dry_run", "qa_log": []}
         ), patch.object(excel_log, "log_application"), patch.object(storage, "mark_applied"), patch.object(
+            storage, "upsert_job"
+        ), patch.object(
             orchestrator, "_preflight_summary_and_confirm"
         ) as mock_preflight:
             orchestrator.run_apply_cycle(live=False)
@@ -166,6 +171,8 @@ class PreflightConfirmationTest(unittest.TestCase):
         ), patch.object(
             naukri_client, "apply_to_job", return_value={"applied": False, "reason": "dry_run", "qa_log": []}
         ), patch.object(excel_log, "log_application"), patch.object(storage, "mark_applied"), patch.object(
+            storage, "upsert_job"
+        ), patch.object(
             orchestrator, "_preflight_summary_and_confirm"
         ) as mock_preflight:
             orchestrator.run_apply_cycle(live=False)
@@ -189,6 +196,8 @@ class PreflightConfirmationTest(unittest.TestCase):
         ), patch.object(
             naukri_client, "apply_to_job", return_value={"applied": True, "reason": "applied", "qa_log": []}
         ), patch.object(excel_log, "log_application"), patch.object(storage, "mark_applied"), patch.object(
+            storage, "upsert_job"
+        ), patch.object(
             orchestrator, "_preflight_summary_and_confirm", return_value=True
         ) as mock_preflight:
             orchestrator.run_apply_cycle(live=True)
@@ -215,6 +224,8 @@ class CircuitBreakerTest(unittest.TestCase):
         ), patch.object(naukri_client, "apply_to_job", apply_mock), patch.object(
             excel_log, "log_application"
         ), patch.object(storage, "mark_applied") as mock_mark_applied, patch.object(
+            storage, "upsert_job"
+        ), patch.object(
             orchestrator, "_preflight_summary_and_confirm", return_value=True
         ), patch.object(
             orchestrator, "_confirm_after_apply_streak", return_value=confirm_streak_return
@@ -273,6 +284,51 @@ class PromptYesTest(unittest.TestCase):
             with self.subTest(response=response):
                 with patch("builtins.input", return_value=response):
                     self.assertFalse(orchestrator._prompt_yes("test message"))
+
+
+class RunScoringCycleEmbeddingReuseTest(unittest.TestCase):
+    """Added 2026-09-06: run_scoring_cycle() computes the resume embedding
+    once (scoring.embed_resume) and passes it into every score_job() call,
+    instead of scoring.py recomputing it per job."""
+
+    def test_embed_resume_called_once_and_threaded_into_every_score_job_call(self):
+        jobs = [
+            {"job_id": "1", "title": "A", "description": "d1"},
+            {"job_id": "2", "title": "B", "description": "d2"},
+            {"job_id": "3", "title": "C", "description": "d3"},
+        ]
+        with patch.object(scoring, "load_resume_profile", return_value="resume text"), patch.object(
+            storage, "get_unscored_jobs", return_value=jobs
+        ), patch.object(scoring, "embed_resume", return_value=[1.0, 0.0]) as mock_embed_resume, patch.object(
+            scoring,
+            "score_job",
+            return_value={"fit_score": 80, "reason": "x", "recommend_apply": True},
+        ) as mock_score_job, patch.object(storage, "upsert_job"):
+            orchestrator.run_scoring_cycle()
+
+        mock_embed_resume.assert_called_once_with("resume text")
+        self.assertEqual(mock_score_job.call_count, 3)
+        for call in mock_score_job.call_args_list:
+            self.assertEqual(call.kwargs.get("resume_embedding"), [1.0, 0.0])
+
+    def test_no_unscored_jobs_skips_embedding_entirely(self):
+        with patch.object(scoring, "load_resume_profile", return_value="resume text"), patch.object(
+            storage, "get_unscored_jobs", return_value=[]
+        ), patch.object(scoring, "embed_resume") as mock_embed_resume:
+            orchestrator.run_scoring_cycle()
+
+        mock_embed_resume.assert_not_called()
+
+    def test_embedding_failure_skips_the_whole_cycle(self):
+        jobs = [{"job_id": "1", "title": "A", "description": "d1"}]
+        with patch.object(scoring, "load_resume_profile", return_value="resume text"), patch.object(
+            storage, "get_unscored_jobs", return_value=jobs
+        ), patch.object(scoring, "embed_resume", return_value=None), patch.object(
+            scoring, "score_job"
+        ) as mock_score_job:
+            orchestrator.run_scoring_cycle()
+
+        mock_score_job.assert_not_called()
 
 
 if __name__ == "__main__":

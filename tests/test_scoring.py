@@ -8,7 +8,7 @@ Run with: python -m unittest discover -s tests
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 
@@ -111,6 +111,142 @@ class ScoreJobTransientFailureTest(unittest.TestCase):
     def test_empty_description_still_returns_real_zero(self):
         result = scoring.score_job("", "some resume")
         self.assertEqual(result["fit_score"], 0)
+
+
+def _mock_verify_response(text):
+    resp = MagicMock()
+    resp.json.return_value = {"response": text}
+    return resp
+
+
+class VerifyScreeningAnswerCacheTest(unittest.TestCase):
+    """Added 2026-09-06 (see DECISIONS.md): _verify_screening_answer()
+    accepts a per-apply-cycle cache dict, since Naukri visibly reuses
+    standard screening questions verbatim across postings -- a literal
+    repeat of (question, answer) within one cycle should skip the LLM
+    call entirely, not re-verify from scratch."""
+
+    def test_cache_hit_skips_second_llm_call(self):
+        cache = {}
+        with patch.object(scoring.requests, "post", return_value=_mock_verify_response("YES")) as mock_post:
+            result1 = scoring._verify_screening_answer("Q1", "A1", "resume", cache=cache)
+            result2 = scoring._verify_screening_answer("Q1", "A1", "resume", cache=cache)
+        self.assertTrue(result1)
+        self.assertTrue(result2)
+        mock_post.assert_called_once()
+
+    def test_different_question_answer_pairs_dont_collide(self):
+        cache = {}
+        responses = [_mock_verify_response("YES"), _mock_verify_response("NO")]
+        with patch.object(scoring.requests, "post", side_effect=responses) as mock_post:
+            result1 = scoring._verify_screening_answer("Q1", "A1", "resume", cache=cache)
+            result2 = scoring._verify_screening_answer("Q1", "A2", "resume", cache=cache)
+        self.assertTrue(result1)
+        self.assertFalse(result2)
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_no_cache_given_always_calls_llm(self):
+        with patch.object(scoring.requests, "post", return_value=_mock_verify_response("YES")) as mock_post:
+            scoring._verify_screening_answer("Q1", "A1", "resume")
+            scoring._verify_screening_answer("Q1", "A1", "resume")
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_transient_failure_is_not_cached_and_can_be_retried(self):
+        cache = {}
+        with patch.object(scoring.requests, "post", side_effect=requests.RequestException("boom")):
+            result1 = scoring._verify_screening_answer("Q1", "A1", "resume", cache=cache)
+        self.assertFalse(result1)
+        self.assertNotIn(("Q1", "A1"), cache)
+
+        with patch.object(scoring.requests, "post", return_value=_mock_verify_response("YES")) as mock_post:
+            result2 = scoring._verify_screening_answer("Q1", "A1", "resume", cache=cache)
+        self.assertTrue(result2)
+        mock_post.assert_called_once()
+
+    def test_draft_screening_answer_threads_cache_through_to_verification(self):
+        cache = {}
+        with patch.object(scoring, "_call_screening_llm", return_value="Yes"), patch.object(
+            scoring.requests, "post", return_value=_mock_verify_response("YES")
+        ) as mock_post:
+            result1 = scoring.draft_screening_answer("Q1", ["Yes", "No"], "resume", cache=cache)
+            result2 = scoring.draft_screening_answer("Q1", ["Yes", "No"], "resume", cache=cache)
+        self.assertEqual(result1, "Yes")
+        self.assertEqual(result2, "Yes")
+        mock_post.assert_called_once()  # verification cached on the second, identical call
+
+
+class MalformedOllamaResponseTest(unittest.TestCase):
+    """Added 2026-09-06: a 200 OK response with an unexpected body (e.g.
+    Ollama returning {"error": "model not found"} instead of the expected
+    key, because a configured model isn't pulled) raises KeyError from the
+    ["embedding"]/["response"] lookup, not requests.RequestException -- it
+    must be handled the same as a transport failure, not crash uncaught."""
+
+    def test_score_job_embedding_missing_key_returns_none_not_crash(self):
+        with patch.object(scoring, "_embed", side_effect=KeyError("embedding")):
+            result = scoring.score_job("some job description", "some resume")
+        self.assertIsNone(result["fit_score"])
+
+    def test_score_job_scoring_llm_missing_key_returns_none_not_crash(self):
+        with patch.object(scoring, "_embed", return_value=[1.0, 0.0]), patch.object(
+            scoring, "_call_scoring_llm", side_effect=KeyError("response")
+        ):
+            result = scoring.score_job("some job description", "some resume")
+        self.assertIsNone(result["fit_score"])
+
+    def test_draft_screening_answer_missing_key_returns_none_not_crash(self):
+        with patch.object(scoring, "_call_screening_llm", side_effect=KeyError("response")):
+            result = scoring.draft_screening_answer("Some question?", ["Yes", "No"], "resume")
+        self.assertIsNone(result)
+
+    def test_verify_screening_answer_missing_key_returns_false_not_crash(self):
+        resp = MagicMock()
+        resp.json.return_value = {"error": "model not found"}  # no "response" key
+        with patch.object(scoring.requests, "post", return_value=resp):
+            result = scoring._verify_screening_answer("Q", "A", "resume")
+        self.assertFalse(result)
+
+
+class ResumeEmbeddingReuseTest(unittest.TestCase):
+    """Added 2026-09-06: the resume embedding is computed once per scoring
+    cycle (scoring.embed_resume(), called by orchestrator.run_scoring_cycle())
+    and passed into score_job() instead of being recomputed per job."""
+
+    def test_embed_resume_returns_the_embedding(self):
+        with patch.object(scoring, "_embed", return_value=[1.0, 2.0, 3.0]) as mock_embed:
+            result = scoring.embed_resume("some resume text")
+        self.assertEqual(result, [1.0, 2.0, 3.0])
+        mock_embed.assert_called_once_with("some resume text")
+
+    def test_embed_resume_returns_none_on_failure_not_raise(self):
+        with patch.object(scoring, "_embed", side_effect=requests.RequestException("boom")):
+            result = scoring.embed_resume("some resume text")
+        self.assertIsNone(result)
+
+    def test_embed_resume_returns_none_on_malformed_response(self):
+        with patch.object(scoring, "_embed", side_effect=KeyError("embedding")):
+            result = scoring.embed_resume("some resume text")
+        self.assertIsNone(result)
+
+    def test_score_job_with_precomputed_embedding_does_not_recompute_resume_embedding(self):
+        # _embed should be called exactly once (for job_description) --
+        # NOT a second time for resume_profile, since resume_embedding was
+        # already supplied.
+        with patch.object(scoring, "_embed", return_value=[1.0, 0.0]) as mock_embed, patch.object(
+            scoring, "_call_scoring_llm", return_value='{"fit_score": 80, "reason": "x", "recommend_apply": true}'
+        ):
+            result = scoring.score_job("some job description", "some resume", resume_embedding=[1.0, 0.0])
+        mock_embed.assert_called_once_with("some job description")
+        self.assertEqual(result["fit_score"], 80)
+
+    def test_score_job_without_precomputed_embedding_still_computes_it(self):
+        # Backward-compat: no resume_embedding given -> falls back to
+        # computing it internally, same as before this change.
+        with patch.object(scoring, "_embed", return_value=[1.0, 0.0]) as mock_embed, patch.object(
+            scoring, "_call_scoring_llm", return_value='{"fit_score": 80, "reason": "x", "recommend_apply": true}'
+        ):
+            scoring.score_job("some job description", "some resume")
+        self.assertEqual(mock_embed.call_count, 2)  # job_description AND resume_profile
 
 
 if __name__ == "__main__":

@@ -19,9 +19,15 @@ def run_search_cycle(keywords: str, location: str = ""):
     session (see naukri_client.search_jobs_with_details). Replaces the
     former search_jobs() + per-job get_job_details() pattern, which opened
     a fresh browser context and re-checked login before every single job —
-    ~10s/job overhead, confirmed live 2026-09-05. See DECISIONS.md."""
+    ~10s/job overhead, confirmed live 2026-09-05. See DECISIONS.md.
+
+    Jobs already known from a prior search (a stored, non-empty
+    description in jobs.db) have their detail fetch skipped entirely —
+    see storage.get_job_ids_with_description() and
+    naukri_client.search_jobs_with_details's skip_job_ids param."""
     log.info("Searching for %r in %r...", keywords, location or "(any location)")
-    jobs = naukri_client.search_jobs_with_details(keywords, location)
+    already_known = storage.get_job_ids_with_description()
+    jobs = naukri_client.search_jobs_with_details(keywords, location, skip_job_ids=already_known)
     log.info("Found %d jobs.", len(jobs))
 
     for job in jobs:
@@ -39,8 +45,19 @@ def run_scoring_cycle():
     unscored = storage.get_unscored_jobs()
     log.info("Scoring %d unscored job(s)...", len(unscored))
 
+    if not unscored:
+        return
+
+    # Computed ONCE for the whole cycle, not once per job — resume_profile
+    # doesn't change across jobs within one cycle, so re-embedding it N
+    # times for N jobs was pure waste. See scoring.embed_resume().
+    resume_embedding = scoring.embed_resume(resume_profile)
+    if resume_embedding is None:
+        log.error("Could not embed resume_profile - skipping this scoring cycle entirely.")
+        return
+
     for job in unscored:
-        result = scoring.score_job(job.get("description") or "", resume_profile)
+        result = scoring.score_job(job.get("description") or "", resume_profile, resume_embedding=resume_embedding)
         storage.upsert_job(
             {
                 "job_id": job["job_id"],
@@ -203,6 +220,13 @@ def run_apply_cycle(live: bool = False):
                 return
 
         resume_profile = scoring.load_resume_profile() if config.AUTO_ANSWER_SCREENING_QUESTIONS else None
+        # Fresh per cycle, never persisted — Naukri visibly reuses standard
+        # screening questions verbatim across postings (see DECISIONS.md),
+        # so this skips a redundant _verify_screening_answer() call for a
+        # literal repeat within THIS cycle only. resume_profile is fixed
+        # for the whole cycle by the time this is created, so it's safe to
+        # key the cache on (question, answer) alone. See scoring.py.
+        verification_cache: dict = {}
 
         consecutive_applies = 0
         recent_applies: list = []
@@ -219,7 +243,7 @@ def run_apply_cycle(live: bool = False):
                 # description — see scoring.draft_screening_answer.
                 job_description = job.get("description") or ""
                 answer_fn = lambda question, options, jd=job_description: scoring.draft_screening_answer(
-                    question, options, resume_profile, jd
+                    question, options, resume_profile, jd, cache=verification_cache
                 )
 
             try:
@@ -247,9 +271,15 @@ def run_apply_cycle(live: bool = False):
                 )
                 result = {"applied": False, "reason": f"unexpected_error: {e}", "qa_log": [], "external_url": None}
 
+            # apply_outcome persisted for EVERY attempt (added 2026-09-06) --
+            # previously only lived in applications_log.xlsx's free-text
+            # Outcome Reason column; jobs.db had no queryable record of why
+            # an apply attempt did or didn't succeed. See storage.get_status_summary.
+            job_update = {"job_id": job["job_id"], "apply_outcome": result["reason"]}
             external_url = result.get("external_url")
             if external_url:
-                storage.upsert_job({"job_id": job["job_id"], "external_apply_url": external_url})
+                job_update["external_apply_url"] = external_url
+            storage.upsert_job(job_update)
 
             excel_log.log_application(
                 company=job.get("company", ""),
@@ -300,6 +330,25 @@ def run_apply_cycle(live: bool = False):
         config.DRY_RUN = original_dry_run
 
 
+def run_status_report():
+    """Read-only summary of jobs.db's current state -- "how did the last
+    run go" without hand-written SQL (previously the README's own
+    documented method). Added 2026-09-06, see DECISIONS.md and
+    storage.get_status_summary()."""
+    summary = storage.get_status_summary()
+    print(f"Total jobs: {summary['total_jobs']}")
+    print(f"  Unscored: {summary['unscored']}")
+    print(f"  Scored: {summary['scored']} (recommend_apply=True: {summary['recommend_apply_true']})")
+    print(f"Applied: {summary['applied_real']} real, {summary['applied_dry_run']} dry-run")
+    print(f"Applied today: {summary['applied_today']} / {summary['daily_cap']} daily cap")
+    if summary["apply_outcomes"]:
+        print("Apply outcomes:")
+        for outcome, count in summary["apply_outcomes"].items():
+            print(f"  {count:4d}  {outcome}")
+    else:
+        print("No apply attempts recorded yet.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Naukri job search + scoring")
     subparsers = parser.add_subparsers(dest="cycle", required=True)
@@ -321,6 +370,8 @@ def main():
         ),
     )
 
+    subparsers.add_parser("status", help="read-only summary of jobs.db's current state")
+
     args = parser.parse_args()
     storage.init_db()
 
@@ -330,6 +381,8 @@ def main():
         run_scoring_cycle()
     elif args.cycle == "apply":
         run_apply_cycle(live=args.live)
+    elif args.cycle == "status":
+        run_status_report()
 
 
 if __name__ == "__main__":

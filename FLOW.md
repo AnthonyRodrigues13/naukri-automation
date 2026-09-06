@@ -31,7 +31,7 @@ way; if `scoring.py` ever needs to store something, it returns a value for
 
 ## CLI entry points
 
-`orchestrator.main()` parses `sys.argv` into one of two subcommands, each
+`orchestrator.main()` parses `sys.argv` into a subcommand, each
 calling `storage.init_db()` first, then dispatching:
 
 ```
@@ -40,13 +40,21 @@ python orchestrator.py search "<keywords>" ["<location>"]
 
 python orchestrator.py score
   main() -> run_scoring_cycle()
+
+python orchestrator.py apply [--live]
+  main() -> run_apply_cycle(live=args.live)
+
+python orchestrator.py status
+  main() -> run_status_report()          # added 2026-09-06, read-only, no storage.init_db()
+                                          # side effects beyond the schema migration it already does
 ```
 
 ## `run_search_cycle(keywords, location)` — orchestrator.py
 
 ```
 run_search_cycle
- └─ naukri_client.search_jobs_with_details(keywords, location)
+ ├─ already_known = storage.get_job_ids_with_description()   # added 2026-09-06
+ └─ naukri_client.search_jobs_with_details(keywords, location, skip_job_ids=already_known)
      ├─ get_browser_context()            # launch_persistent_context, ONE Chrome window
      │                                   # for the entire run, added 2026-09-05
      ├─ ensure_logged_in(page)           # ONCE for the whole run, not per job — goto
@@ -58,10 +66,16 @@ run_search_cycle
      │       └─ extract {job_id, title, company, url} via JOB_CARD_SELECTOR /
      │          JOB_TITLE_SELECTOR / JOB_COMPANY_SELECTOR
      └─ for each job returned above, on the SAME page:
+         ├─ job["job_id"] in skip_job_ids?                     # added 2026-09-06
+         │     -> results.append(dict(job))   # NO "description" key at all --
+         │        storage.upsert_job() below only SETs keys present in the dict,
+         │        so omitting it leaves the existing stored description untouched
+         │     -> continue (detail fetch skipped entirely for this job)
          ├─ try: _scrape_job_details(page, job["url"])
          │   ├─ goto job page                                    # no fresh context,
          │   └─ extract description (JOB_DESCRIPTION_SELECTOR)   # no re-login —
          │       + meta (JOB_META_SELECTOR, discarded by the caller) # same page/session
+         │       -> empty match? log.warning(...)                 # added 2026-09-06
          │   except Exception: log full traceback, description = ""
          │     # added 2026-09-05 alongside the reuse fix -- with everything now built
          │     # up in one list over the whole function (not persisted per-job by the
@@ -73,12 +87,14 @@ run_search_cycle
             # (unlike the old per-job get_job_details(), which let
             # run_search_cycle() log progress after each one), so this is
             # logged here instead to keep a run-in-progress visible
+     ├─ empty_description_count > 0? log.warning("N/M job(s) had an empty
+     │     description...")                                       # added 2026-09-06
      (context closed here — ONE browser session for the whole search AND every job's
       detail fetch, not one per job)
 
  └─ for each job in the returned list: storage.upsert_job(job)
-     # job already has job_id/title/company/url/description -- no merging needed
-     # at the call site any more (search_jobs_with_details did it internally)
+     # job already has job_id/title/company/url/description (unless skipped, see
+     # above) -- no merging needed at the call site any more
 ```
 
 Fixed 2026-09-05 (see DECISIONS.md): the old `search_jobs()` + per-job
@@ -102,15 +118,24 @@ in the multi-minute version.
 run_scoring_cycle
  ├─ scoring.load_resume_profile()        # reads resume.md once for the whole cycle
  ├─ storage.get_unscored_jobs()          # SELECT ... WHERE fit_score IS NULL
+ ├─ no unscored jobs? return                                    # added 2026-09-06
+ ├─ resume_embedding = scoring.embed_resume(resume_profile)      # added 2026-09-06,
+ │     ONCE for the whole cycle, not once per job -- resume_profile doesn't
+ │     change across jobs within one cycle, so re-embedding it per job was waste
+ ├─ resume_embedding is None? log + return                       # skip the WHOLE
+ │     cycle rather than try every job against a missing embedding
  └─ for each unscored job:
-     ├─ scoring.score_job(job["description"], resume_profile)
-     │   ├─ _embed(job_description), _embed(resume_profile)   # POST /api/embeddings
-     │   │   └─ requests.RequestException -> {fit_score: None, ...}  # added 2026-09-05,
-     │   │      see below -- NOT the same as a real 0
+     ├─ scoring.score_job(job["description"], resume_profile, resume_embedding=resume_embedding)
+     │   ├─ _embed(job_description); resume side uses resume_embedding directly,
+     │   │     no _embed(resume_profile) call any more                # POST /api/embeddings
+     │   │   └─ (requests.RequestException, KeyError, TypeError) -> {fit_score: None, ...}
+     │   │      # KeyError/TypeError added 2026-09-06 -- a 200 OK with an unexpected
+     │   │      # body (e.g. Ollama {"error": "model not found"}) is not a
+     │   │      # RequestException, but must be treated the same way, see below
      │   ├─ _cosine_similarity(...)
      │   │   └─ if below EMBED_SIMILARITY_FLOOR: return {fit_score: 0, ...} — LLM never called
      │   ├─ _call_scoring_llm(...)        # POST /api/generate, format=json, think=false
-     │   │   └─ requests.RequestException -> {fit_score: None, ...}  # added 2026-09-05
+     │   │   └─ (requests.RequestException, KeyError, TypeError) -> {fit_score: None, ...}
      │   ├─ _parse_score_response(raw)    # json.loads + shape/type validation
      │   │   └─ on failure: retry _call_scoring_llm once, then _FALLBACK_RESULT (fit_score: 0)
      │   └─ returns {fit_score, reason, recommend_apply}   # fit_score: int 0-100, or None
@@ -141,7 +166,16 @@ in flight.
 
 `live` comes straight from the CLI's `apply --live` flag (main()) — a
 second, per-invocation signal on top of config.DRY_RUN, added 2026-09-05
-(see DECISIONS.md). Neither one alone is enough to go real:
+(see DECISIONS.md). Neither one alone is enough to go real.
+
+Every `{applied: ..., reason: ..., qa_log: ...}` dict shown below and in
+`_handle_screening_chatbot` (further down) is actually a
+`naukri_client.ApplyResult` (added 2026-09-06, see DECISIONS.md) — always
+carrying `external_url` too (`None` except for
+`reason="external_apply_not_supported"`), built via the single
+`_apply_result()` function so every return path in both functions is
+guaranteed the same shape. Simplified to the three most-relevant keys
+below for readability:
 
 ```
 run_apply_cycle(live)
@@ -193,6 +227,10 @@ run_apply_cycle(live)
      │   │      (never fills or answers anything in the modal)
      │   ├─ button text now says "applied" -> {applied: True, reason: "applied", qa_log: []}
      │   └─ else -> {applied: False, reason: "apply_outcome_unclear_manual_review", qa_log: []}
+     ├─ storage.upsert_job({job_id, apply_outcome: result["reason"], [external_apply_url
+     │      if result.get("external_url")]})                       # added 2026-09-06 --
+     │      apply_outcome persisted for EVERY attempt, not just when external_url
+     │      happens to be set (previously the only trigger for this upsert call at all)
      ├─ excel_log.log_application(company=job["company"], title=job["title"], ...,
      │      fit_score=job["fit_score"], fit_reason=job["reason"],
      │      applied=result["applied"], outcome_reason=result["reason"],
@@ -217,12 +255,21 @@ run_apply_cycle(live)
 
 `answer_fn` is built **per job**, inside the `run_apply_cycle()` loop, only
 when `config.AUTO_ANSWER_SCREENING_QUESTIONS` is `True`:
-`lambda question, options, jd=job_description: scoring.draft_screening_answer(question, options, resume_profile, jd)`
+`lambda question, options, jd=job_description: scoring.draft_screening_answer(question, options, resume_profile, jd, cache=verification_cache)`
 — per-job (not built once outside the loop) so `job_description` can be
 bound per closure, letting `draft_screening_answer` see each job's own
 description. This is how the LLM call in `scoring.py` reaches
 `naukri_client.py` without `naukri_client` importing `scoring` directly
 (module boundary, see below).
+
+`verification_cache = {}` (added 2026-09-06, see DECISIONS.md) IS built
+once outside the loop, right alongside `resume_profile` — the opposite of
+`job_description`'s per-job binding, deliberately: it's meant to persist
+*across* jobs for the whole cycle, keyed on `(question, answer)` inside
+`scoring._verify_screening_answer()`. Naukri reuses standard screening
+questions verbatim across postings, so a repeat within one cycle skips a
+redundant verification LLM call. Never persisted across process runs —
+recreated fresh every `run_apply_cycle()` call.
 
 ### `_handle_screening_chatbot(page, job_id, answer_fn)` — naukri_client.py
 
@@ -374,8 +421,48 @@ code or an agent should do on its own. `AUTO_ANSWER_SCREENING_QUESTIONS`
 defaults to `False` on top of that — both must be deliberately set for
 `_handle_screening_chatbot` to ever run for real.
 
+## `run_status_report()` — orchestrator.py
+
+Added 2026-09-06 (see DECISIONS.md), backing the `status` CLI subcommand.
+Entirely read-only — no writes, no browser, no Ollama.
+
+```
+run_status_report
+ └─ storage.get_status_summary()   # a handful of read-only aggregate COUNT(*) queries:
+        total jobs, unscored, scored, recommend_apply=True count,
+        applied (real vs dry-run) counts, today's real-apply count,
+        apply_outcome value -> count (GROUP BY)
+ └─ print(...)                     # plain stdout, not logged via `log`
+```
+
 ## Phase 3 (not started)
 
 `naukri_client.get_inbox_messages()` and `send_reply()` both currently just
 `raise NotImplementedError`. No orchestrator cycle exists yet for polling the
 inbox or drafting replies via `scoring`'s LLM plumbing.
+
+**Investigated 2026-09-06, implementation deliberately deferred** (see
+DECISIONS.md): the inbox lives at `https://www.naukri.com/mnjuser/inbox`
+(linked from the nav bar), and its message list is populated by:
+
+```
+POST https://www.naukri.com/cloudgateway-nc-js/nc-services/v0/template/ni-inboxusermails-svc-tmpl_v0
+```
+
+Live-verified response wrapper shape (real, from this account, which
+currently has zero messages so `inbox` is empty):
+
+```json
+{"successResponse": {"total": 0, "mailsTotal": 0, "mailsUnreadTotal": 0,
+  "unreadPowerNvite": 0, "unread": 0, "totalPowerNvite": 0,
+  "unreadMostRelevantMail": 0, "unseenOthersMailPresent": 0, "inbox": []},
+ "exceptions": {...}, "additionalProp": {...}}
+```
+
+The wrapper (top-level counts, `inbox` as a list) is confirmed; the shape
+of an individual item INSIDE `inbox` is not — there's no real message in
+this account to inspect one against, and guessing field names (sender,
+body, timestamp) here would repeat exactly the mistake this project's own
+incident history warns against (see DECISIONS.md). Deliberately not
+implemented until a real message exists to verify against, rather than
+shipping a best-effort guess.

@@ -1261,3 +1261,292 @@ carries no live risk unless and until that flag is deliberately flipped.
 The action-dict vocabulary (8 action types) is more moving parts than the
 original single function's straight-line branching — accepted as the
 direct cost of making the logic testable at all.
+
+---
+
+## 2026-09-06 — Screening-answer verification cached per apply cycle, not per call
+
+**Decision:** `scoring._verify_screening_answer()` now accepts an optional
+`cache: dict | None`, checked/populated for the exact `(question, answer)`
+pair before making a real LLM call. `draft_screening_answer()` takes the
+same `cache` parameter and passes it straight through.
+`orchestrator.run_apply_cycle()` creates `verification_cache = {}` once,
+outside the per-job loop (alongside `resume_profile`), and threads it into
+the `answer_fn` closure passed to `naukri_client.apply_to_job()`.
+
+**Context:** `_verify_screening_answer()`'s signature is a pure function
+of `(question, answer, resume_profile)` — no `job_description` involved at
+all, unlike the drafting call. Naukri visibly reuses standard screening
+questions verbatim across postings (see this file's Yellowblock/
+Coffeebeans entries — both hit a near-identical notice-period question).
+Every distinct question a real apply cycle encounters still gets the full,
+independent verification pass this file already committed to (see the
+"Fixed via a verification pass" entry) — this only skips a LITERAL repeat
+of a question this same cycle has already verified, not a new judgment.
+
+**Alternatives considered:**
+- Cache the drafting call (`_call_screening_llm`) too, not just
+  verification — rejected: drafting takes `job_description`, which varies
+  per job even for identical question text, and is documented as
+  influencing range-based calibration (see the CTC-calibration entries).
+  Caching by `(question, options, resume_profile)` alone would risk
+  reusing an answer that was implicitly shaped by a different job's
+  description. Verification has no such parameter, so it's the only safe
+  place to cache without also solving a harder problem.
+- A module-level cache in `scoring.py`, reset via an explicit call at the
+  top of each cycle — rejected in favor of an explicit dict created by the
+  caller and threaded through, matching how `resume_profile` is already
+  handled (loaded once per cycle, passed explicitly) rather than
+  introducing a new hidden-global pattern this codebase doesn't otherwise
+  use.
+- Key the cache on `(question, answer, resume_profile)` for extra safety
+  — not necessary: `resume_profile` is already fixed for the entire
+  lifetime of any one `verification_cache` instance (it's loaded once,
+  before the cache is created, and neither changes for the rest of the
+  cycle), so including it in the key would only ever match itself.
+
+**Tradeoff:** A transient verification failure
+(`requests.RequestException`) is deliberately NOT cached — only a real
+YES/NO verdict is — so a network blip on one job doesn't lock out a
+legitimate retry of the same question on a later job in the same cycle.
+No behavior change for the (currently, in practice) common case of a
+cycle with few or no repeated questions; the benefit scales with how much
+Naukri actually reuses question text within one run.
+
+---
+
+## 2026-09-06 — External-apply "marks Applied" side effect investigated live; not separable from the click without breaking the redirect
+
+**What was done:** With explicit, deliberate user authorization (this
+necessarily reproduces the documented side effect on a real job, purely
+for diagnostic purposes — the user chose this tradeoff knowingly), ran
+two live experiments against real external-apply jobs, network tracing on:
+
+1. **Observation** (Careallianz job `060226506993`): attached
+   `page.on("request")` to the original Naukri tab right before clicking
+   `EXTERNAL_APPLY_SELECTOR`. The very first event captured — before any
+   analytics/tracking noise — was a full-page **document navigation**:
+   `GET /myapply/showAcp?file=<job_id>&multiApplyResp={"<job_id>":202}`.
+   Confirmed via reload afterward: the external-apply button was gone
+   (job marked Applied, as already documented).
+
+2. **Intervention** (Optum job `240826930772`): set
+   `page.route("**/*", ...)` on the original tab to abort specifically
+   the `/myapply/showAcp` request, hypothesizing that blocking this one
+   navigation would prevent the mark-applied effect while the separate
+   `window.open()` to the external site (a different Page object,
+   unaffected by this route) still succeeded. The block DID fire — the
+   original tab ended up on `chrome-error://chromewebdata/`, confirming
+   the navigation was genuinely aborted, not merely observed. **The job
+   was still marked Applied anyway** (confirmed via a fresh navigation
+   afterward — external-apply button gone).
+
+**What this means:** The `/myapply/showAcp` navigation on the original
+tab is NOT the mechanism that marks the job Applied — it's a client-side
+confirmation-page display, and blocking it doesn't stop whatever actually
+registers the application server-side. The real mechanism is most likely
+on the **new tab's own navigation chain**: `context.expect_page()` only
+reports the tab's FINAL url (e.g., `careers.unitedhealthgroup.com/...`)
+after any redirects — the new tab plausibly opens first to a Naukri-owned
+tracking/redirect URL that both registers the application AND issues the
+redirect to the real external site, entirely outside anything a route
+handler on the ORIGINAL page could see or block. This wasn't confirmed
+(would require tracing requests on the new Page object itself, a third
+live test), but it fits the evidence: something fired and completed
+successfully before or independent of the one navigation actually blocked.
+
+**Decision:** Stopping the live investigation here rather than pursuing a
+third test. Even if the exact mechanism were confirmed, it's very
+plausibly the SAME request that both marks the application and supplies
+the actual redirect destination (a single tracking/redirect hop serving
+both purposes) — in which case blocking it wouldn't isolate the side
+effect, it would just break the one thing `CAPTURE_EXTERNAL_APPLY_URLS`
+exists to do (learn where the job actually leads). Two real jobs were
+already spent on this investigation for a negative result; a third with a
+real chance of the same outcome, or of breaking URL capture entirely if
+partially successful, isn't a good trade.
+
+**Tradeoff:** `config.CAPTURE_EXTERNAL_APPLY_URLS`'s documented side
+effect stands as originally accepted (see the 2026-09-01 entry) — this
+investigation makes it more precisely understood (client-side interception
+on the visible page doesn't touch it) without changing the recommendation:
+stay `False` by default unless the value of capturing the destination URL
+is deliberately judged worth the side effect for a specific job.
+
+---
+
+## 2026-09-06 — Five small quick-win fixes from the codebase review
+
+Batched together since each is small and independent; full context for
+each is in the code comments at the change site.
+
+**1. Malformed 200-OK Ollama responses now caught, not just transport
+errors.** `scoring.py`'s four Ollama-call sites (`score_job`'s embedding
+and scoring-LLM calls, `draft_screening_answer`, `_verify_screening_answer`)
+now catch `(requests.RequestException, KeyError, TypeError)`, not just
+`requests.RequestException`. Verified first: `requests` 2.34.2's
+`resp.json()` already wraps malformed (non-JSON) bodies in
+`requests.exceptions.JSONDecodeError`, itself a `RequestException`
+subclass — already handled. The real gap was a VALID JSON response
+missing the expected key (e.g. Ollama returning `{"error": "model not
+found"}` when a configured model isn't pulled), which raises a plain
+`KeyError` from `["embedding"]`/`["response"]`, uncaught anywhere. Treated
+identically to a transport failure in each caller (same reasoning as the
+existing `fit_score=None` fix: a missing-model misconfiguration is exactly
+the kind of thing a later retry, after the user fixes it, should resolve).
+
+**2. Description-selector breakage now logged.** `JOB_DESCRIPTION_SELECTOR`
+has already silently broken once (see its own comment). `_scrape_job_details()`
+now logs a per-job warning when it matches nothing, and
+`search_jobs_with_details()` logs one summary line per run
+("N/M job(s) had an empty description") if any occurred — visible at a
+glance instead of only discoverable later as a cluster of unexplained
+`fit_score=0` rows.
+
+**3. Already-known jobs skip the detail re-fetch.** Added
+`storage.get_job_ids_with_description()` and a `skip_job_ids` parameter on
+`naukri_client.search_jobs_with_details()`; `run_search_cycle()` passes
+one to the other. A skipped job's result dict has NO `"description"` key
+at all (not an empty string) — `storage.upsert_job()` only SETs keys
+present in the dict, so omitting it leaves the existing stored value
+untouched rather than overwriting it with an empty one. `naukri_client.py`
+still never imports `storage` (module boundary, see FLOW.md) — the
+caller supplies the already-known set, same pattern as `answer_fn`.
+
+**4. Resume embedding computed once per scoring cycle, not once per
+job.** Added `scoring.embed_resume(resume_profile) -> list[float] | None`
+(returns `None` on failure rather than raising, logged, so
+`run_scoring_cycle()` can skip the whole cycle cleanly) and a
+`resume_embedding` parameter on `score_job()` — when given, skips
+re-computing `_embed(resume_profile)`, which was previously identical on
+every single call within one cycle since `resume_profile` doesn't change
+across jobs. `run_scoring_cycle()` computes it once, before the loop, and
+skips the entire cycle (logged) if it fails rather than trying every job
+against a missing embedding. `score_job()` still falls back to computing
+it internally when not given, so it stays usable standalone.
+
+**5. `apply_outcome` column + `status` subcommand.** `jobs.db` previously
+had no queryable record of *why* an apply attempt did or didn't succeed —
+only `applications_log.xlsx`'s free-text column, and the README's own
+documented way to check "how did the last run go" was a raw `sqlite3`
+one-liner. Added `apply_outcome TEXT` (migrated in the same way as
+`external_apply_url`, guarded by a presence check since `ALTER TABLE ADD
+COLUMN IF NOT EXISTS` doesn't exist in SQLite), persisted for every apply
+attempt (not just successful ones) via `run_apply_cycle()`'s existing
+per-job `storage.upsert_job()` call (merged into the same call rather
+than a second one). Added `storage.get_status_summary()` (read-only
+aggregate counts) and a `status` CLI subcommand
+(`orchestrator.run_status_report()`) that prints it. Pre-existing rows
+from before this column existed simply show no outcome, same as
+`external_apply_url`'s original migration.
+
+**Tradeoff (all five):** None significant on their own. Fixing #5
+required adding `storage.upsert_job` mocks to several existing
+apply-cycle tests that didn't previously need them — `apply_outcome` is
+now persisted unconditionally (every attempt, not just when an
+`external_url` happens to be present, which was the only previous
+trigger for that call), so those tests would otherwise have started
+writing test job_ids into the real `jobs.db` on every test run. Caught
+before it caused actual pollution — verified `jobs.db`'s mtime is
+unchanged across a full test run.
+
+---
+
+## 2026-09-06 — `apply_to_job()`/`_handle_screening_chatbot()` given a typed, consistently-built return contract
+
+**Decision:** Added `naukri_client.ApplyResult` (a `typing.TypedDict` with
+`applied: bool`, `reason: str`, `qa_log: list`, `external_url: str | None`)
+and `_apply_result(applied, reason, qa_log=None, external_url=None)` — the
+ONE function that builds every return value in both `apply_to_job()` (9
+return statements) and `_handle_screening_chatbot()` (7 return statements,
+whose return value IS one of `apply_to_job()`'s own, in the branch that
+hands off to it directly). Both functions' signatures now say `->
+ApplyResult` instead of `-> dict`.
+
+**Context:** From the codebase review's medium-initiatives item:
+`external_url` previously appeared in only 1 of `apply_to_job()`'s 9
+return statements — every other path either never reached that branch or
+simply omitted the key, relying on `orchestrator.py`'s `.get("external_url")`
+to paper over the inconsistency. Nothing enforced that every return
+statement actually produced the same shape; a future return statement
+added without going through a shared builder could easily reintroduce the
+same gap, or a different one (a typo'd key name, a forgotten `qa_log`).
+
+**Alternatives considered:**
+- A full `@dataclass` (or a plain class) instead of `TypedDict` + dict —
+  rejected: would require every caller (`orchestrator.py`'s
+  `result["reason"]`/`result.get(...)` access, `excel_log.log_application()`'s
+  parameters, every test's dict-literal assertions) to switch to attribute
+  access, a much larger, more invasive change for the same practical
+  benefit. This codebase uses plain dicts with conventionally-consistent
+  shapes everywhere else (`qa_log` entries, the chatbot's action dicts) —
+  `TypedDict` documents the same shape formally without breaking that
+  pattern or requiring call-site changes.
+- `TypedDict` alone, without a builder function — rejected: a `TypedDict`
+  is purely a static-typing annotation with zero runtime enforcement:
+  nothing stops a return statement from constructing a dict missing a key
+  or with an extra one, which is exactly the bug being fixed. The builder
+  function is what actually guarantees consistency at runtime, in a
+  codebase with no mypy/type-checking CI to catch a `TypedDict` mismatch
+  otherwise.
+
+**Verification:** Existing tests already asserted exact dict equality on
+`_handle_screening_chatbot()`'s return value in two places (missing the
+now-always-present `external_url: None`) — these failures were the
+intended signal that the shape genuinely changed everywhere, not a sign
+of a mistake; updated both to the new consistent shape. Also confirmed
+live with a real dry-run `apply` cycle after the change.
+
+**Tradeoff:** None significant — purely additive consistency; no caller
+needed to change since `.get("external_url")` already handled both "key
+present with a value" and "key present with None" identically, and now
+never sees "key absent" at all.
+
+---
+
+## 2026-09-06 — Phase 3 (inbox scraping) implementation deliberately deferred: no real message to verify field names against
+
+**What was done:** Live investigation (read-only — navigation and network
+observation only, no writes) to find Naukri's recruiter-message inbox
+ahead of implementing `naukri_client.get_inbox_messages()`. Found it at
+`https://www.naukri.com/mnjuser/inbox` (linked from the nav bar) and
+identified the API it calls:
+`POST https://www.naukri.com/cloudgateway-nc-js/nc-services/v0/template/ni-inboxusermails-svc-tmpl_v0`,
+confirmed returning
+`{"successResponse": {"total", "mailsTotal", "mailsUnreadTotal", "unread",
+..., "inbox": [...]}, "exceptions": {...}, ...}`. Checked several other
+read-only avenues too (nav-bar text search, header/GNB DOM dump, the
+page's own JS bundle) — none revealed anything more.
+
+**The blocker:** this account currently has zero messages/invites ("You
+have no NVites yet!"), so the live-captured `inbox` array is empty — the
+WRAPPER shape (top-level counts, `inbox` as a list) is real and verified;
+the shape of an individual item INSIDE that list (sender field name, body
+field, timestamp format, read/unread flag, etc.) is not, and can't be
+without a real message to inspect.
+
+**Decision:** Asked the user how to handle this rather than guess. Chose
+to wait for a real message to arrive before implementing the per-item
+parsing, rather than shipping a best-effort field-name guess now.
+
+**Alternatives considered:**
+- Implement defensively now with fallback key-name candidates and the raw
+  JSON preserved per item, explicitly flagged as unverified (this was
+  offered as the recommended default) — not chosen; the user preferred to
+  wait for real data.
+- Implement only the wrapper/count-level parsing (unread count, total
+  count) now, leaving individual message extraction as a stub — rejected
+  on my own judgment before even offering it: `get_inbox_messages()`'s
+  entire point is extracting messages, so a version that only reports
+  counts wouldn't be a real (if partial) step toward that, it would be a
+  stub dressed up as a feature — the kind of half-finished implementation
+  this project's conventions explicitly warn against.
+
+**Tradeoff:** Phase 3 makes no code progress this session. Accepted
+deliberately — every other guessed-selector mistake in this project's
+history (see the many "live-verified" fixes throughout this file) was
+found the hard way, after shipping; better to not repeat that pattern
+here when the fix is simply "wait for a real message," a low-cost delay
+compared to building on a wrong assumption and having to unwind it later.
+The API endpoint and wrapper shape are preserved in FLOW.md so this
+investigation doesn't need repeating whenever implementation resumes.

@@ -76,6 +76,22 @@ def _embed(text: str) -> list[float]:
     return resp.json()["embedding"]
 
 
+def embed_resume(resume_profile: str) -> list[float] | None:
+    """Computes the resume's embedding once, for reuse across every job in
+    one scoring cycle via score_job(..., resume_embedding=...) — added
+    2026-09-06. The resume text doesn't change within a cycle (loaded once
+    in run_scoring_cycle()), so re-embedding it per job, identically, N
+    times for N jobs was pure waste. Returns None (doesn't raise) on
+    failure so run_scoring_cycle() can skip the whole cycle cleanly rather
+    than crash — matches this module's fallback-on-failure convention
+    elsewhere (see score_job)."""
+    try:
+        return _embed(resume_profile)
+    except (requests.RequestException, KeyError, TypeError) as e:
+        log.error("Failed to compute resume embedding - cannot score this cycle: %s", e)
+        return None
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -273,7 +289,24 @@ Does the resume specifically and accurately support this exact answer — not so
 Respond with exactly YES or NO. Nothing else."""
 
 
-def _verify_screening_answer(question: str, answer: str, resume_profile: str) -> bool:
+def _verify_screening_answer(question: str, answer: str, resume_profile: str, cache: dict | None = None) -> bool:
+    """`cache`, if given, is checked/populated for the exact (question,
+    answer) pair before making a real LLM call. Naukri visibly reuses
+    standard screening questions verbatim across postings (see
+    DECISIONS.md's Yellowblock/Coffeebeans examples) — a cache scoped to
+    one apply cycle (the caller creates it fresh per cycle, never persisted
+    across process runs) skips only literal repeats of a question this
+    cycle has already verified, never a new judgment. resume_profile is
+    deliberately NOT part of the cache key: it's fixed for the whole cycle
+    by the time a cache is passed in (loaded once in run_apply_cycle()), so
+    a (question, answer) pair means the same verification for the cache's
+    entire lifetime. This does not reopen the doubled-latency-per-call
+    tradeoff recorded below — every distinct (question, answer) pair still
+    gets verified at full rigor; only literal repeats are skipped."""
+    cache_key = (question, answer)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
     prompt = VERIFY_ANSWER_PROMPT_TEMPLATE.format(
         resume_profile=resume_profile, question=question, answer=answer
     )
@@ -290,19 +323,30 @@ def _verify_screening_answer(question: str, answer: str, resume_profile: str) ->
             timeout=120,
         )
         resp.raise_for_status()
-        verdict = resp.json()["response"].strip().upper()
-    except requests.RequestException as e:
+        verdict_text = resp.json()["response"].strip().upper()
+    except (requests.RequestException, KeyError, TypeError) as e:
+        # KeyError/TypeError: a 200 OK with an unexpected body (e.g.
+        # {"error": "..."} instead of {"response": "..."}) shouldn't crash
+        # this function — rejecting the answer is already this function's
+        # safe default for any failure, so no new behavior needed here,
+        # just a wider net.
         log.error("Screening-answer verification call failed: %s — rejecting answer to be safe.", e)
-        return False
-    if verdict.startswith("YES"):
-        return True
-    if not verdict.startswith("NO"):
-        log.warning("Verification returned neither YES nor NO (%r) — rejecting answer to be safe.", verdict)
-    return False
+        return False  # deliberately not cached — a transient failure shouldn't poison a repeat of this question
+
+    if verdict_text.startswith("YES"):
+        verdict = True
+    else:
+        if not verdict_text.startswith("NO"):
+            log.warning("Verification returned neither YES nor NO (%r) — rejecting answer to be safe.", verdict_text)
+        verdict = False
+
+    if cache is not None:
+        cache[cache_key] = verdict
+    return verdict
 
 
 def draft_screening_answer(
-    question: str, options: list[str] | None, resume_profile: str, job_description: str = ""
+    question: str, options: list[str] | None, resume_profile: str, job_description: str = "", cache: dict | None = None
 ) -> str | None:
     """Drafts an answer to a job-application screening question, grounded
     only in resume_profile. Returns None (never a guess) if the resume
@@ -340,6 +384,11 @@ def draft_screening_answer(
     re-verified (no reproduced failure there yet). This roughly doubles
     latency for fixed-option questions — an accepted tradeoff, not a
     default anyone should assume without checking config/instructions.
+
+    `cache`, if given, is passed straight through to _verify_screening_answer
+    (see its docstring) — a dict the caller creates fresh once per apply
+    cycle (not this function's job to manage), so repeat questions across
+    jobs in the same cycle skip a redundant verification call.
     """
     if _mentions_salary(question):
         log.info("Screening question mentions salary/CTC — always skipping auto-answer: %r", question)
@@ -347,7 +396,11 @@ def draft_screening_answer(
 
     try:
         raw = _call_screening_llm(question, options, resume_profile, job_description)
-    except requests.RequestException as e:
+    except (requests.RequestException, KeyError, TypeError) as e:
+        # KeyError/TypeError: a 200 OK with an unexpected body (missing
+        # "response") shouldn't crash the apply cycle -- None already means
+        # "can't confidently answer, needs manual review", the correct
+        # outcome here regardless of which of these three raised.
         log.error("Screening-answer LLM call failed: %s", e)
         return None
 
@@ -357,7 +410,7 @@ def draft_screening_answer(
     if options:
         for opt in options:
             if raw.strip().lower() == opt.strip().lower():
-                if _verify_screening_answer(question, opt, resume_profile):
+                if _verify_screening_answer(question, opt, resume_profile, cache=cache):
                     return opt
                 log.warning(
                     "Screening answer %r for %r failed independent verification — skipping.", opt, question
@@ -369,8 +422,15 @@ def draft_screening_answer(
     return _clean_free_text_answer(raw, question)
 
 
-def score_job(job_description: str, resume_profile: str) -> dict:
+def score_job(job_description: str, resume_profile: str, resume_embedding: list[float] | None = None) -> dict:
     """Must return {"fit_score": 0-100 or None, "reason": str, "recommend_apply": bool}.
+
+    `resume_embedding`, if given, is used instead of re-computing
+    _embed(resume_profile) — see embed_resume(), which run_scoring_cycle()
+    calls once per cycle since resume_profile doesn't change across jobs
+    within one cycle. Falls back to computing it here when not given, so
+    this function stays usable standalone (tests, any future direct
+    caller) without requiring a caller to precompute anything.
 
     recommend_apply from the LLM is a signal, not the sole gate — callers
     (orchestrator.run_apply_cycle) must still enforce config.FIT_SCORE_THRESHOLD
@@ -388,13 +448,25 @@ def score_job(job_description: str, resume_profile: str) -> dict:
     path (empty description, two rounds of unparseable JSON from the model)
     still returns a real 0 via _FALLBACK_RESULT — those aren't transport
     failures, so there's no reason to expect a retry would do better.
+
+    Also catches KeyError/TypeError, not just requests.RequestException —
+    a 200 OK response with an unexpected body (e.g. Ollama returning
+    {"error": "model not found"} instead of {"embedding": [...]} because a
+    configured model isn't pulled) doesn't trip raise_for_status() at all,
+    so it would otherwise reach the ["embedding"]/["response"] lookup and
+    crash with a KeyError, uncaught anywhere above this function. Treated
+    the same as a transport failure (fit_score=None, retryable) since a
+    misconfiguration like a missing model is exactly the kind of thing a
+    later retry (after the user fixes it) should succeed at, unlike a
+    genuinely-scored answer the model just failed to format as JSON.
     """
     if not job_description.strip():
         return {**_FALLBACK_RESULT, "reason": "empty job description, needs manual review"}
 
     try:
-        similarity = _cosine_similarity(_embed(job_description), _embed(resume_profile))
-    except requests.RequestException as e:
+        resume_vec = resume_embedding if resume_embedding is not None else _embed(resume_profile)
+        similarity = _cosine_similarity(_embed(job_description), resume_vec)
+    except (requests.RequestException, KeyError, TypeError) as e:
         log.error("Embedding call failed: %s", e)
         return {"fit_score": None, "reason": f"embedding call failed: {e}", "recommend_apply": False}
 
@@ -408,7 +480,7 @@ def score_job(job_description: str, resume_profile: str) -> dict:
     for attempt in range(2):
         try:
             raw = _call_scoring_llm(job_description, resume_profile)
-        except requests.RequestException as e:
+        except (requests.RequestException, KeyError, TypeError) as e:
             log.error("Scoring LLM call failed: %s", e)
             return {"fit_score": None, "reason": f"LLM call failed: {e}", "recommend_apply": False}
 
