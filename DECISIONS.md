@@ -1715,3 +1715,76 @@ model call, which is intentionally less reproducible run-to-run for a
 job that's genuinely near the threshold — that's the point: a single
 noisy sample is what the researched clustering behavior showed was
 unreliable near 70 in the first place.
+
+---
+
+## 2026-09-06 — Repost/duplicate-job detection (roadmap item 7)
+
+**Decision:** `run_search_cycle()` now embeds every newly-found job's
+description (`scoring.embed_job_description()`) and compares it, via
+cosine similarity, against every previously-seen ORIGINAL job's stored
+embedding (`storage.get_original_job_embeddings()` — originals only,
+`duplicate_of IS NULL`, so a chain of reposts always resolves back to
+one true original) plus any original found earlier in the SAME search
+batch. A match at or above `config.DUPLICATE_SIMILARITY_THRESHOLD`
+(0.97) sets `jobs.duplicate_of` to the original's `job_id`. Duplicates
+are excluded from `storage.get_unscored_jobs()` (never independently
+scored) and `storage.get_applicable_jobs()` (defense in depth — never
+applied to even if a `fit_score` somehow exists). `storage.upsert_job()`
+also stores a JSON-serialized `description_embedding` for every job with
+one, needed both to check future jobs against it and to make an
+already-checked job itself a valid candidate for later ones.
+
+**Context:** `JOB_SEARCH_STRATEGY.md` roadmap item 7 — Naukri visibly
+reposts the same underlying listing under a brand-new `job_id`, which
+the existing `skip_job_ids` known-job-id check (see the 2026-09-05
+search-reuse entry above) can never catch, since it keys on `job_id`
+alone. Before implementing, calibrated the similarity threshold against
+REAL scraped postings already in `jobs.db` rather than guessing, mirroring
+the `EMBED_SIMILARITY_FLOOR` precedent: three Accenture "AI / ML Engineer"
+postings scraped seconds apart measured 0.9920-0.9982 cosine similarity
+(genuine reposts/near-duplicates); two DIFFERENT jobs at DIFFERENT
+companies that merely share Naukri's own auto-generated disclaimer
+boilerplate ("This job description has been sourced from a public
+domain...") measured as high as 0.9228 — a real false-positive risk
+that would otherwise have gone unnoticed. `0.97` sits with margin above
+that boilerplate-collision ceiling and below the genuine-repost floor
+measured live. Applied retroactively via a one-off backfill script
+(not committed — a data migration, not a feature) against the existing
+44-job `jobs.db`: correctly flagged 2 of the 3 Accenture postings as
+reposts of the earliest-scraped one, and did NOT flag two other
+same-title/same-company job pairs (Micro1 "AI Engineer" at 0.9581,
+Flytbase "Agentic AI Engineer" at 0.8538) that measured below threshold.
+
+**Alternatives considered:**
+- Exact/near-exact text comparison (hash or `difflib` ratio on
+  normalized description text) instead of embeddings — rejected: the
+  roadmap explicitly called for reusing the embedding/cosine-similarity
+  infrastructure `scoring.py` already has, and the measured boilerplate
+  false-positive risk (0.9228 between unrelated jobs) suggests a naive
+  text-overlap measure would likely fare no better, without the benefit
+  of reusing existing, already-tested infrastructure.
+- A lower threshold (e.g. 0.90-0.93) to also catch the Micro1/Flytbase
+  same-title pairs — rejected: those pairs measured BELOW the
+  boilerplate-collision ceiling (0.9228) observed between genuinely
+  unrelated jobs, so a threshold that low would risk false-positiving on
+  unrelated postings far more often than it would gain in catching
+  genuine reposts. Missing a real repost costs one extra scoring pass;
+  wrongly suppressing a genuinely different job is worse and unrecoverable
+  without noticing, so the threshold was set conservatively (biased
+  toward NOT flagging) — see `config.DUPLICATE_SIMILARITY_THRESHOLD`.
+- Re-scoring a flagged duplicate by literally copying the original's
+  `fit_score`/`reason` onto it — rejected: simpler to just exclude
+  duplicates from scoring/apply entirely (they're visible in `jobs.db`
+  and `status`'s "Duplicates detected" count, but never independently
+  acted on), no risk of a stale copied score becoming misleading if the
+  original is later re-scored.
+
+**Tradeoff:** One extra embedding call per newly-scraped job (cheap
+relative to the LLM scoring call, and only paid at scrape time, not
+scoring time). A genuinely conservative threshold means some real
+reposts with more heavily edited descriptions won't be caught (accepted
+— see alternatives above); `storage.get_status_summary()`'s `unscored`/
+`scored` counts had to be recomputed directly rather than derived via
+subtraction, now that duplicates are excluded from one but included in
+`total_jobs`.

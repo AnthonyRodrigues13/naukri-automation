@@ -341,5 +341,80 @@ class ScoreJobWithReverificationTest(unittest.TestCase):
             self.assertEqual(call.kwargs.get("resume_embedding"), [1.0, 0.0])
 
 
+class EmbedJobDescriptionTest(unittest.TestCase):
+    """Repost/duplicate detection, added 2026-09-06 (see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md roadmap item 7)."""
+
+    def test_returns_the_embedding(self):
+        with patch.object(scoring, "_embed", return_value=[1.0, 2.0, 3.0]) as mock_embed:
+            result = scoring.embed_job_description("some job description")
+        self.assertEqual(result, [1.0, 2.0, 3.0])
+        mock_embed.assert_called_once_with("some job description")
+
+    def test_returns_none_on_transport_failure_not_raise(self):
+        with patch.object(scoring, "_embed", side_effect=requests.RequestException("boom")):
+            result = scoring.embed_job_description("some job description")
+        self.assertIsNone(result)
+
+    def test_returns_none_on_malformed_response(self):
+        with patch.object(scoring, "_embed", side_effect=KeyError("embedding")):
+            result = scoring.embed_job_description("some job description")
+        self.assertIsNone(result)
+
+
+class FindDuplicateJobTest(unittest.TestCase):
+    """Repost/duplicate detection, added 2026-09-06 (see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md roadmap item 7). Assumes the project default
+    config.DUPLICATE_SIMILARITY_THRESHOLD = 0.97."""
+
+    def setUp(self):
+        self.assertEqual(config.DUPLICATE_SIMILARITY_THRESHOLD, 0.97, "tests assume the default threshold")
+
+    def test_no_candidates_returns_none(self):
+        self.assertIsNone(scoring.find_duplicate_job([1.0, 0.0], []))
+
+    def test_identical_embedding_is_flagged_as_duplicate(self):
+        candidates = [{"job_id": "orig", "embedding": [1.0, 0.0]}]
+        result = scoring.find_duplicate_job([1.0, 0.0], candidates)
+        self.assertEqual(result, "orig")
+
+    def test_clearly_dissimilar_embedding_is_not_flagged(self):
+        candidates = [{"job_id": "orig", "embedding": [1.0, 0.0]}]
+        result = scoring.find_duplicate_job([0.0, 1.0], candidates)  # orthogonal -> similarity 0.0
+        self.assertIsNone(result)
+
+    def test_similarity_just_below_threshold_is_not_flagged(self):
+        # cos(theta) for these two 2D unit-ish vectors lands just under 0.97
+        candidates = [{"job_id": "orig", "embedding": [1.0, 0.0]}]
+        result = scoring.find_duplicate_job([0.96, 0.28], candidates)
+        self.assertIsNone(result)
+
+    def test_similarity_exactly_at_threshold_is_flagged(self):
+        # cos(theta) = 0.97 exactly (sin(theta) = sqrt(1 - 0.97**2)) -- the
+        # threshold check must be inclusive (>=), not strict (>).
+        candidates = [{"job_id": "orig", "embedding": [1.0, 0.0]}]
+        result = scoring.find_duplicate_job([0.97, (1 - 0.97**2) ** 0.5], candidates)
+        self.assertEqual(result, "orig")
+
+    def test_picks_the_single_most_similar_candidate_among_several(self):
+        candidates = [
+            {"job_id": "far", "embedding": [0.0, 1.0]},
+            {"job_id": "close", "embedding": [1.0, 0.0]},
+            {"job_id": "medium", "embedding": [0.7, 0.7]},
+        ]
+        result = scoring.find_duplicate_job([1.0, 0.0], candidates)
+        self.assertEqual(result, "close")
+
+    def test_no_candidate_meets_threshold_returns_none_even_if_one_is_the_best_match(self):
+        # cosine([1,0], [0.7,0.3]) ~= 0.919 -- clearly the best of the two,
+        # but still below config.DUPLICATE_SIMILARITY_THRESHOLD (0.97).
+        candidates = [
+            {"job_id": "somewhat_close", "embedding": [0.7, 0.3]},
+            {"job_id": "far", "embedding": [0.0, 1.0]},
+        ]
+        result = scoring.find_duplicate_job([1.0, 0.0], candidates)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

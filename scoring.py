@@ -92,6 +92,47 @@ def embed_resume(resume_profile: str) -> list[float] | None:
         return None
 
 
+def embed_job_description(description: str) -> list[float] | None:
+    """Computes a job description's embedding for repost/duplicate detection
+    (see find_duplicate_job(), storage.get_original_job_embeddings()) --
+    added 2026-09-06, JOB_SEARCH_STRATEGY.md roadmap item 7. Returns None
+    (doesn't raise) on failure, mirroring embed_resume(): a transient
+    embedding failure should skip duplicate detection for this one job,
+    not crash the whole search cycle."""
+    try:
+        return _embed(description)
+    except (requests.RequestException, KeyError, TypeError) as e:
+        log.error("Failed to compute job description embedding - skipping duplicate check for this job: %s", e)
+        return None
+
+
+def find_duplicate_job(new_embedding: list[float], candidates: list[dict]) -> str | None:
+    """Pure function, no I/O. `candidates` is [{"job_id", "embedding"}, ...]
+    for previously-seen ORIGINAL jobs only (never a job that's itself
+    already flagged as a repost of something else -- see
+    storage.get_original_job_embeddings() -- so a chain of reposts always
+    resolves back to one true original instead of drifting). Returns the
+    job_id of the single most-similar candidate if its cosine similarity to
+    new_embedding is >= config.DUPLICATE_SIMILARITY_THRESHOLD, else None.
+
+    Threshold calibrated 2026-09-06 against real scraped postings (see
+    DECISIONS.md and config.DUPLICATE_SIMILARITY_THRESHOLD): genuine
+    reposts of the same underlying job measured 0.9920-0.9982 cosine
+    similarity; two DIFFERENT jobs that merely share Naukri's own
+    auto-generated disclaimer boilerplate measured as high as 0.9228 -- a
+    real false-positive risk this threshold must sit above."""
+    best_job_id = None
+    best_similarity = -1.0
+    for candidate in candidates:
+        similarity = _cosine_similarity(new_embedding, candidate["embedding"])
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_job_id = candidate["job_id"]
+    if best_job_id is not None and best_similarity >= config.DUPLICATE_SIMILARITY_THRESHOLD:
+        return best_job_id
+    return None
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))

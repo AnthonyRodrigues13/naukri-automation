@@ -2,6 +2,7 @@
 search, score, apply — are real and wired into main()."""
 
 import argparse
+import json
 import logging
 from datetime import datetime
 
@@ -25,14 +26,44 @@ def run_search_cycle(keywords: str, location: str = ""):
     Jobs already known from a prior search (a stored, non-empty
     description in jobs.db) have their detail fetch skipped entirely —
     see storage.get_job_ids_with_description() and
-    naukri_client.search_jobs_with_details's skip_job_ids param."""
+    naukri_client.search_jobs_with_details's skip_job_ids param.
+
+    Repost/duplicate detection (added 2026-09-06, roadmap item 7): a
+    repost gets a brand-new job_id, so the skip_job_ids check above never
+    catches it. Each newly-found job's description embedding is compared
+    against every ORIGINAL job already known (see
+    storage.get_original_job_embeddings() — never against another
+    repost, so chains resolve to one true original) and against
+    originals found earlier in this SAME batch, since one batch of
+    search results can itself contain more than one repost of the same
+    posting. A match sets duplicate_of, excluding it from
+    run_scoring_cycle() (see storage.get_unscored_jobs())."""
     storage.record_run("search")
     log.info("Searching for %r in %r...", keywords, location or "(any location)")
     already_known = storage.get_job_ids_with_description()
     jobs = naukri_client.search_jobs_with_details(keywords, location, skip_job_ids=already_known)
     log.info("Found %d jobs.", len(jobs))
 
+    candidates = storage.get_original_job_embeddings()
+
     for job in jobs:
+        description = job.get("description") or ""
+        if description.strip():
+            embedding = scoring.embed_job_description(description)
+            if embedding is not None:
+                job["description_embedding"] = json.dumps(embedding)
+                duplicate_of = scoring.find_duplicate_job(embedding, candidates)
+                if duplicate_of:
+                    job["duplicate_of"] = duplicate_of
+                    log.info(
+                        "Job %s (%s) flagged as a repost of %s - excluded from scoring.",
+                        job["job_id"],
+                        job.get("title", ""),
+                        duplicate_of,
+                    )
+                else:
+                    candidates.append({"job_id": job["job_id"], "embedding": embedding})
+
         storage.upsert_job(job)
         log.info("Saved job %s - %s at %s", job["job_id"], job["title"], job["company"])
 
@@ -362,6 +393,8 @@ def run_status_report():
     print(f"Total jobs: {summary['total_jobs']}")
     print(f"  Unscored: {summary['unscored']}")
     print(f"  Scored: {summary['scored']} (recommend_apply=True: {summary['recommend_apply_true']})")
+    if summary["duplicates_detected"]:
+        print(f"  Duplicates detected: {summary['duplicates_detected']} (reposts, excluded from scoring)")
     print(f"Applied: {summary['applied_real']} real, {summary['applied_dry_run']} dry-run")
     print(f"Applied today: {summary['applied_today']} / {summary['daily_cap']} daily cap")
     if summary["apply_outcomes"]:

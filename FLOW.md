@@ -97,9 +97,28 @@ run_search_cycle
      (context closed here — ONE browser session for the whole search AND every job's
       detail fetch, not one per job)
 
- └─ for each job in the returned list: storage.upsert_job(job)
-     # job already has job_id/title/company/url/description (unless skipped, see
-     # above) -- no merging needed at the call site any more
+ ├─ candidates = storage.get_original_job_embeddings()   # repost/duplicate
+ │     detection, added 2026-09-06 -- originals only (duplicate_of IS NULL),
+ │     so a chain of reposts always resolves back to one true original
+ └─ for each job in the returned list:
+     ├─ description non-empty?
+     │   ├─ embedding = scoring.embed_job_description(description)
+     │   │   └─ _embed(description)          # POST /api/embeddings
+     │   │       └─ (requests.RequestException, KeyError, TypeError) -> None,
+     │   │          logged, NOT fatal -- this one job just skips the check
+     │   └─ embedding is not None:
+     │       ├─ job["description_embedding"] = json.dumps(embedding)
+     │       ├─ scoring.find_duplicate_job(embedding, candidates)
+     │       │   └─ cosine_similarity vs each candidate; best match returned
+     │       │      if >= config.DUPLICATE_SIMILARITY_THRESHOLD (0.97), else None
+     │       ├─ match found -> job["duplicate_of"] = that job_id, logged
+     │       │      (excluded from storage.get_unscored_jobs() from here on)
+     │       └─ no match -> candidates.append({job_id, embedding})   # so a
+     │              SECOND repost later in this SAME batch also matches
+     └─ storage.upsert_job(job)
+        # job already has job_id/title/company/url/description (unless skipped, see
+        # above), plus description_embedding/duplicate_of when set above -- no
+        # merging needed at the call site any more
 ```
 
 Fixed 2026-09-05 (see DECISIONS.md): the old `search_jobs()` + per-job

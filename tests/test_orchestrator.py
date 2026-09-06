@@ -14,6 +14,7 @@ Ollama, or database writes. Confirmation prompts are patched directly
 input()-wrapping helper itself.
 """
 
+import json
 import sys
 import unittest
 from datetime import datetime, timedelta
@@ -419,7 +420,7 @@ class RecordRunWiringTest(unittest.TestCase):
             storage, "get_job_ids_with_description", return_value=set()
         ), patch.object(naukri_client, "search_jobs_with_details", return_value=[]), patch.object(
             storage, "upsert_job"
-        ):
+        ), patch.object(storage, "get_original_job_embeddings", return_value=[]):
             orchestrator.run_search_cycle("python developer", "Pune")
         mock_record_run.assert_called_once_with("search")
 
@@ -443,6 +444,99 @@ class RecordRunWiringTest(unittest.TestCase):
         ), patch.object(storage, "get_outcome_correlation", return_value=[]):
             orchestrator.run_check_status_cycle()
         mock_record_run.assert_called_once_with("check-status")
+
+
+class RunSearchCycleDuplicateDetectionTest(unittest.TestCase):
+    """Repost/duplicate detection, added 2026-09-06 (see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md roadmap item 7). Only scoring.embed_job_description
+    is mocked (to control embeddings deterministically) -- scoring.find_duplicate_job
+    runs for real, so these tests exercise the actual cosine-similarity
+    comparison, not just the wiring."""
+
+    def _run(self, jobs, existing_candidates, embeddings_by_job_id):
+        upserted = []
+        with patch.object(storage, "get_job_ids_with_description", return_value=set()), patch.object(
+            naukri_client, "search_jobs_with_details", return_value=jobs
+        ), patch.object(storage, "get_original_job_embeddings", return_value=existing_candidates), patch.object(
+            storage, "upsert_job", side_effect=lambda job: upserted.append(dict(job))
+        ), patch.object(
+            scoring, "embed_job_description", side_effect=lambda desc: embeddings_by_job_id.get(desc)
+        ):
+            orchestrator.run_search_cycle("python developer", "Pune")
+        return upserted
+
+    def test_job_matching_an_existing_original_is_flagged_as_a_duplicate(self):
+        job = {"job_id": "new1", "title": "T", "company": "C", "url": "u", "description": "desc-new1"}
+        upserted = self._run(
+            jobs=[job],
+            existing_candidates=[{"job_id": "orig1", "embedding": [1.0, 0.0]}],
+            embeddings_by_job_id={"desc-new1": [1.0, 0.0]},  # identical -> similarity 1.0
+        )
+        self.assertEqual(upserted[0]["duplicate_of"], "orig1")
+        self.assertEqual(json.loads(upserted[0]["description_embedding"]), [1.0, 0.0])
+
+    def test_job_not_matching_any_existing_original_is_not_flagged(self):
+        job = {"job_id": "new1", "title": "T", "company": "C", "url": "u", "description": "desc-new1"}
+        upserted = self._run(
+            jobs=[job],
+            existing_candidates=[{"job_id": "orig1", "embedding": [1.0, 0.0]}],
+            embeddings_by_job_id={"desc-new1": [0.0, 1.0]},  # orthogonal -> similarity 0.0
+        )
+        self.assertNotIn("duplicate_of", upserted[0])
+        self.assertEqual(json.loads(upserted[0]["description_embedding"]), [0.0, 1.0])
+
+    def test_second_repost_within_the_same_batch_matches_the_first_new_original_not_just_stored_ones(self):
+        # No pre-existing originals in storage at all -- job_b is a repost
+        # of job_a, and both are discovered in the SAME search_jobs_with_details
+        # call, so job_a must become a candidate the moment it's processed,
+        # not only on the NEXT search cycle.
+        job_a = {"job_id": "a", "title": "T", "company": "C", "url": "ua", "description": "desc-a"}
+        job_b = {"job_id": "b", "title": "T", "company": "C", "url": "ub", "description": "desc-b"}
+        upserted = self._run(
+            jobs=[job_a, job_b],
+            existing_candidates=[],
+            embeddings_by_job_id={"desc-a": [1.0, 0.0], "desc-b": [1.0, 0.0]},
+        )
+        self.assertNotIn("duplicate_of", upserted[0])  # job_a: nothing to match yet
+        self.assertEqual(upserted[1]["duplicate_of"], "a")  # job_b: matches job_a from this same batch
+
+    def test_a_duplicate_is_never_added_to_the_in_batch_candidate_pool(self):
+        # job_b is flagged as a duplicate of job_a; job_c is near-identical
+        # to job_b too, but must resolve back to job_a (the true original),
+        # never to job_b (itself already a duplicate).
+        job_a = {"job_id": "a", "title": "T", "company": "C", "url": "ua", "description": "desc-a"}
+        job_b = {"job_id": "b", "title": "T", "company": "C", "url": "ub", "description": "desc-b"}
+        job_c = {"job_id": "c", "title": "T", "company": "C", "url": "uc", "description": "desc-c"}
+        upserted = self._run(
+            jobs=[job_a, job_b, job_c],
+            existing_candidates=[],
+            embeddings_by_job_id={"desc-a": [1.0, 0.0], "desc-b": [1.0, 0.0], "desc-c": [1.0, 0.0]},
+        )
+        self.assertNotIn("duplicate_of", upserted[0])
+        self.assertEqual(upserted[1]["duplicate_of"], "a")
+        self.assertEqual(upserted[2]["duplicate_of"], "a")
+
+    def test_empty_description_skips_duplicate_check_entirely(self):
+        job = {"job_id": "new1", "title": "T", "company": "C", "url": "u", "description": ""}
+        with patch.object(storage, "get_job_ids_with_description", return_value=set()), patch.object(
+            naukri_client, "search_jobs_with_details", return_value=[job]
+        ), patch.object(storage, "get_original_job_embeddings", return_value=[]), patch.object(
+            storage, "upsert_job"
+        ) as mock_upsert, patch.object(scoring, "embed_job_description") as mock_embed:
+            orchestrator.run_search_cycle("python developer", "Pune")
+        mock_embed.assert_not_called()
+        self.assertNotIn("duplicate_of", mock_upsert.call_args.args[0])
+        self.assertNotIn("description_embedding", mock_upsert.call_args.args[0])
+
+    def test_embedding_failure_is_not_fatal_and_leaves_job_unflagged(self):
+        job = {"job_id": "new1", "title": "T", "company": "C", "url": "u", "description": "desc-new1"}
+        upserted = self._run(
+            jobs=[job],
+            existing_candidates=[{"job_id": "orig1", "embedding": [1.0, 0.0]}],
+            embeddings_by_job_id={},  # embed_job_description returns None (dict.get default)
+        )
+        self.assertNotIn("duplicate_of", upserted[0])
+        self.assertNotIn("description_embedding", upserted[0])
 
 
 class FormatTimeAgoTest(unittest.TestCase):

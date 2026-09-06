@@ -98,6 +98,23 @@ AUTO_ANSWER_SCREENING_QUESTIONS = False
 # capture a link; flip it deliberately once you've weighed that tradeoff.
 CAPTURE_EXTERNAL_APPLY_URLS = False
 
+# A newly-scraped job is flagged as a repost/duplicate of an existing job
+# (jobs.duplicate_of set, excluded from scoring/apply -- see
+# scoring.find_duplicate_job(), storage.get_original_job_embeddings()) when
+# its description embedding's cosine similarity to an existing job's is at
+# or above this. Calibrated 2026-09-06 against real scraped postings, not
+# guessed -- see DECISIONS.md: genuine reposts of the same underlying
+# posting measured 0.9920-0.9982; two DIFFERENT jobs that merely share
+# Naukri's own auto-generated disclaimer boilerplate measured as high as
+# 0.9228, a real false-positive risk. 0.97 sits with margin above that
+# boilerplate-collision ceiling and below the genuine-repost floor. Set
+# deliberately conservative (biased toward NOT flagging): missing a real
+# repost just costs one extra scoring pass, but wrongly flagging a
+# genuinely different job as a duplicate would silently remove it from
+# scoring/apply consideration entirely -- a worse failure mode, so this
+# leans toward the safer direction when in doubt.
+DUPLICATE_SIMILARITY_THRESHOLD = 0.97
+
 # --- Ollama models — no runtime code should hardcode a model name elsewhere ---
 
 OLLAMA_MODELS = {

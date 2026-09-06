@@ -41,7 +41,10 @@ This tool never automates OTP entry. The session persists in
 as that directory isn't deleted.
 
 The run logs how many jobs were found and saves them to `jobs.db` (SQLite).
-Inspect results with:
+A job that's a repost of one already known under a different `job_id` is
+detected automatically (by comparing description embeddings — see
+`DECISIONS.md`) and flagged rather than treated as new; it's never scored
+or applied to independently. Inspect results with:
 
 ```
 sqlite3 jobs.db "select title, company, url from jobs;"
@@ -75,10 +78,11 @@ in Excel; it's a human-readable companion to `jobs.db`, not something other
 code reads. The same outcome is also persisted to `jobs.db`'s
 `apply_outcome` column for every attempt, queryable without opening Excel.
 
-For a quick read-only summary — how many jobs are scored, how many have
-been applied to (real vs. dry-run), a breakdown of apply outcomes, and
-how long it's been since you last ran each cycle (`search`/`score`/
-`apply`/`check-status`) — without hand-written SQL:
+For a quick read-only summary — how many jobs are scored, how many were
+detected as reposts of a job already known, how many have been applied to
+(real vs. dry-run), a breakdown of apply outcomes, and how long it's been
+since you last ran each cycle (`search`/`score`/`apply`/`check-status`) —
+without hand-written SQL:
 
 ```
 python orchestrator.py status

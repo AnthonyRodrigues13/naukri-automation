@@ -2,6 +2,7 @@
 no ORM, keeps the audit trail easy to inspect directly with the sqlite3 CLI.
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -25,7 +26,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     external_apply_url TEXT,
     apply_outcome TEXT,
     latest_apply_status TEXT,
-    naukri_ars_score INTEGER
+    naukri_ars_score INTEGER,
+    description_embedding TEXT,
+    duplicate_of TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -94,6 +97,10 @@ def init_db():
             conn.execute("ALTER TABLE jobs ADD COLUMN latest_apply_status TEXT")
         if "naukri_ars_score" not in existing_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN naukri_ars_score INTEGER")
+        if "description_embedding" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN description_embedding TEXT")
+        if "duplicate_of" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN duplicate_of TEXT")
 
 
 def upsert_job(job: dict):
@@ -129,9 +136,32 @@ def get_job(job_id: str) -> dict | None:
 
 
 def get_unscored_jobs() -> list[dict]:
+    """Excludes jobs flagged as a repost (duplicate_of IS NOT NULL) --
+    added 2026-09-06, roadmap item 7: a repost never gets its own
+    independent fit_score, so it must never reach run_scoring_cycle()'s
+    LLM-scoring loop in the first place. See scoring.find_duplicate_job()
+    and get_original_job_embeddings()."""
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM jobs WHERE fit_score IS NULL").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE fit_score IS NULL AND duplicate_of IS NULL"
+        ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_original_job_embeddings() -> list[dict]:
+    """Candidate pool for repost/duplicate detection (see
+    scoring.find_duplicate_job()) -- added 2026-09-06, roadmap item 7. Only
+    jobs with a stored description_embedding AND duplicate_of IS NULL
+    (i.e. not themselves already flagged as a repost of something else)
+    are eligible originals, so a chain of reposts always resolves back to
+    one true original rather than drifting to whichever repost happened
+    to be checked most recently."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT job_id, description_embedding FROM jobs "
+            "WHERE description_embedding IS NOT NULL AND duplicate_of IS NULL"
+        ).fetchall()
+        return [{"job_id": r["job_id"], "embedding": json.loads(r["description_embedding"])} for r in rows]
 
 
 def get_job_ids_with_description() -> set[str]:
@@ -223,7 +253,20 @@ def get_status_summary() -> dict:
     pointed at). Nothing here writes anything."""
     with _connect() as conn:
         total = conn.execute("SELECT COUNT(*) n FROM jobs").fetchone()["n"]
-        unscored = conn.execute("SELECT COUNT(*) n FROM jobs WHERE fit_score IS NULL").fetchone()["n"]
+        # Excludes reposts (duplicate_of IS NOT NULL) -- they never get
+        # scored (see get_unscored_jobs()), so counting them here would
+        # make "unscored" grow forever even though nothing is actually
+        # waiting to be scored. Reported separately below instead.
+        unscored = conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE fit_score IS NULL AND duplicate_of IS NULL"
+        ).fetchone()["n"]
+        # Computed directly (not total - unscored) so it stays correct now
+        # that duplicates are excluded from unscored but not from total --
+        # added 2026-09-06, roadmap item 7.
+        scored = conn.execute("SELECT COUNT(*) n FROM jobs WHERE fit_score IS NOT NULL").fetchone()["n"]
+        duplicates_detected = conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE duplicate_of IS NOT NULL"
+        ).fetchone()["n"]
         recommend_apply_true = conn.execute(
             "SELECT COUNT(*) n FROM jobs WHERE recommend_apply = 1"
         ).fetchone()["n"]
@@ -241,7 +284,8 @@ def get_status_summary() -> dict:
     return {
         "total_jobs": total,
         "unscored": unscored,
-        "scored": total - unscored,
+        "scored": scored,
+        "duplicates_detected": duplicates_detected,
         "recommend_apply_true": recommend_apply_true,
         "applied_real": applied_real,
         "applied_dry_run": applied_dry_run,
@@ -282,11 +326,16 @@ def get_applicable_jobs(min_fit_score: int) -> list[dict]:
     still sets applied=1 for audit visibility (see mark_applied), but must
     not remove the job from future consideration — otherwise running a dry
     run once would mark every candidate applied and a later real run would
-    see nothing left to apply to."""
+    see nothing left to apply to.
+
+    `duplicate_of IS NULL` added 2026-09-06 (roadmap item 7) as defense in
+    depth: a repost should never have a fit_score in the first place (see
+    get_unscored_jobs()), but this guards against ever applying to one even
+    if that invariant is somehow violated."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM jobs WHERE fit_score >= ? AND (applied = 0 OR dry_run = 1) "
-            "ORDER BY fit_score DESC",
+            "AND duplicate_of IS NULL ORDER BY fit_score DESC",
             (min_fit_score,),
         ).fetchall()
         return [dict(r) for r in rows]
