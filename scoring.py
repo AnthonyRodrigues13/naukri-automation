@@ -490,3 +490,71 @@ def score_job(job_description: str, resume_profile: str, resume_embedding: list[
         log.warning("Attempt %d: invalid JSON from scoring model: %.200r", attempt + 1, raw)
 
     return _FALLBACK_RESULT
+
+
+def score_job_with_reverification(
+    job_description: str, resume_profile: str, resume_embedding: list[float] | None = None
+) -> dict:
+    """Wraps score_job() with re-verification for borderline scores —
+    added 2026-09-06 (see DECISIONS.md and JOB_SEARCH_STRATEGY.md).
+
+    Research found single-pass LLM-judge fit scores cluster at multiples
+    of 5 near common thresholds — a reproducible precision artifact, not
+    genuine fine-grained discrimination between, say, 65 and 75. When the
+    FIRST pass's fit_score lands within config.FIT_SCORE_REVERIFY_MARGIN
+    of config.FIT_SCORE_THRESHOLD, this re-scores the SAME job (same
+    inputs) config.FIT_SCORE_REVERIFY_PASSES - 1 more times and returns
+    the AVERAGE (rounded to the nearest int) as the final fit_score.
+    recommend_apply is recomputed from that average against
+    FIT_SCORE_THRESHOLD directly — not averaged or majority-voted on its
+    own — so the pass/fail decision stays traceable to one number instead
+    of two independently-wobbling ones. A score clearly outside the gray
+    zone is trusted on the first pass and returned as-is: most jobs never
+    pay the extra LLM-call cost, only genuinely borderline ones do.
+
+    fit_score can still be None here: a failure on the FIRST pass is
+    returned immediately, unchanged — nothing meaningful to re-verify yet
+    (see score_job's own docstring for what None means). If the first pass
+    succeeds and lands in the gray zone but SOME re-verify passes fail
+    transiently, only the successful ones are averaged — a transient
+    failure during re-verification degrades precision, it doesn't
+    invalidate the attempt. If EVERY re-verify pass fails, the first
+    pass's own real score is returned unchanged (nothing to average
+    against), logged so a run of transient failures during re-verification
+    is visible rather than silently swallowed.
+
+    Deliberately re-runs the embedding + cosine-similarity check on every
+    pass (via score_job()) rather than reusing the first pass's
+    similarity value — those calls are fast/cheap relative to the LLM
+    scoring call, and reusing state across calls here would couple this
+    function to score_job()'s internals more than the simplicity is worth
+    for a feature that only affects a minority of borderline jobs."""
+    first = score_job(job_description, resume_profile, resume_embedding=resume_embedding)
+    if first["fit_score"] is None:
+        return first
+
+    if abs(first["fit_score"] - config.FIT_SCORE_THRESHOLD) > config.FIT_SCORE_REVERIFY_MARGIN:
+        return first
+
+    scores = [first["fit_score"]]
+    for _ in range(config.FIT_SCORE_REVERIFY_PASSES - 1):
+        result = score_job(job_description, resume_profile, resume_embedding=resume_embedding)
+        if result["fit_score"] is not None:
+            scores.append(result["fit_score"])
+
+    if len(scores) == 1:
+        log.warning(
+            "fit_score %d was in the gray zone (threshold %d +/- %d) but every re-verification "
+            "pass failed transiently - using the single first-pass score.",
+            first["fit_score"],
+            config.FIT_SCORE_THRESHOLD,
+            config.FIT_SCORE_REVERIFY_MARGIN,
+        )
+        return first
+
+    average = round(sum(scores) / len(scores))
+    return {
+        "fit_score": average,
+        "reason": f"{first['reason']} (re-verified across {len(scores)} passes: {scores}, averaged to {average})",
+        "recommend_apply": average >= config.FIT_SCORE_THRESHOLD,
+    }

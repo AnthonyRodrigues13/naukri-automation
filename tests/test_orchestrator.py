@@ -310,8 +310,12 @@ class PromptYesTest(unittest.TestCase):
 
 class RunScoringCycleEmbeddingReuseTest(unittest.TestCase):
     """Added 2026-09-06: run_scoring_cycle() computes the resume embedding
-    once (scoring.embed_resume) and passes it into every score_job() call,
-    instead of scoring.py recomputing it per job."""
+    once (scoring.embed_resume) and passes it into every
+    score_job_with_reverification() call, instead of scoring.py
+    recomputing it per job. Mocks score_job_with_reverification directly
+    (the actual function run_scoring_cycle() calls) rather than the
+    lower-level score_job() it wraps, so these tests don't depend on
+    whether a given mocked fit_score happens to land in the gray zone."""
 
     def test_embed_resume_called_once_and_threaded_into_every_score_job_call(self):
         jobs = [
@@ -323,7 +327,7 @@ class RunScoringCycleEmbeddingReuseTest(unittest.TestCase):
             storage, "get_unscored_jobs", return_value=jobs
         ), patch.object(scoring, "embed_resume", return_value=[1.0, 0.0]) as mock_embed_resume, patch.object(
             scoring,
-            "score_job",
+            "score_job_with_reverification",
             return_value={"fit_score": 80, "reason": "x", "recommend_apply": True},
         ) as mock_score_job, patch.object(storage, "upsert_job"):
             orchestrator.run_scoring_cycle()
@@ -346,7 +350,7 @@ class RunScoringCycleEmbeddingReuseTest(unittest.TestCase):
         with patch.object(scoring, "load_resume_profile", return_value="resume text"), patch.object(
             storage, "get_unscored_jobs", return_value=jobs
         ), patch.object(scoring, "embed_resume", return_value=None), patch.object(
-            scoring, "score_job"
+            scoring, "score_job_with_reverification"
         ) as mock_score_job:
             orchestrator.run_scoring_cycle()
 

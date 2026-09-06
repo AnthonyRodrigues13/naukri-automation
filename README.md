@@ -122,6 +122,12 @@ this happens, not silently dropped).
   period and relocation are answered from `resume.md`'s Availability &
   logistics section when it's filled in. Still, this is the highest-risk
   switch in the codebase; flip it deliberately.
+- Scoring itself doesn't trust a single sample near the threshold: a job
+  whose `fit_score` lands within `config.FIT_SCORE_REVERIFY_MARGIN` (10
+  by default) of `config.FIT_SCORE_THRESHOLD` is automatically re-scored
+  `config.FIT_SCORE_REVERIFY_PASSES` times total and the average decides
+  `fit_score`/`recommend_apply` (see `DECISIONS.md`). Jobs clearly above
+  or below the threshold are scored once, as before.
 - `config.PAUSED` is a global kill switch for all write actions.
 - `config.DAILY_APPLICATION_CAP` is enforced in code, not just as an LLM
   instruction.

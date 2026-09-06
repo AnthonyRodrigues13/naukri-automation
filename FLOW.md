@@ -131,7 +131,20 @@ run_scoring_cycle
  ├─ resume_embedding is None? log + return                       # skip the WHOLE
  │     cycle rather than try every job against a missing embedding
  └─ for each unscored job:
-     ├─ scoring.score_job(job["description"], resume_profile, resume_embedding=resume_embedding)
+     ├─ scoring.score_job_with_reverification(job["description"], resume_profile,
+     │      resume_embedding=resume_embedding)                     # added 2026-09-06
+     │   ├─ first = score_job(...)   # the actual embedding+LLM call, see below
+     │   ├─ first["fit_score"] is None? return first unchanged      # nothing to
+     │   │     re-verify yet -- a transport failure, not a real score
+     │   ├─ abs(first["fit_score"] - config.FIT_SCORE_THRESHOLD) > config.FIT_SCORE_REVERIFY_MARGIN?
+     │   │     -> return first unchanged   # clearly outside the gray zone, trusted as-is
+     │   └─ else (in the gray zone): call score_job(...) config.FIT_SCORE_REVERIFY_PASSES - 1
+     │         more times (same inputs), average the successful ones (failures excluded,
+     │         not fatal), round -> final fit_score; recommend_apply = average >= threshold
+     │         (recomputed from the average, not separately voted); reason gets
+     │         " (re-verified across N passes: [...], averaged to M)" appended
+     │
+     │   score_job(job_description, resume_profile, resume_embedding=resume_embedding)
      │   ├─ _embed(job_description); resume side uses resume_embedding directly,
      │   │     no _embed(resume_profile) call any more                # POST /api/embeddings
      │   │   └─ (requests.RequestException, KeyError, TypeError) -> {fit_score: None, ...}

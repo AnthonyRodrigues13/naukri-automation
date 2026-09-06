@@ -60,6 +60,22 @@ MAX_DELAY_SECONDS = 8
 # and the daily cap are the actual gate, enforced in orchestrator.py.
 FIT_SCORE_THRESHOLD = 70
 
+# A single LLM-judged fit_score within this many points of
+# FIT_SCORE_THRESHOLD is not trusted on one pass: research found LLM-judge
+# scores cluster at multiples of 5 near common thresholds (a reproducible
+# precision artifact, not real fine-grained discrimination) -- see
+# DECISIONS.md and JOB_SEARCH_STRATEGY.md. Jobs landing in this band get
+# re-scored FIT_SCORE_REVERIFY_PASSES times total and the AVERAGE decides
+# fit_score/recommend_apply -- see scoring.score_job_with_reverification().
+# Scores clearly outside the band are trusted on the first pass, so most
+# jobs never pay the extra LLM-call cost.
+FIT_SCORE_REVERIFY_MARGIN = 10
+
+# Total scoring passes (including the first) for a job that lands in the
+# gray zone above. 3 means 2 EXTRA LLM calls beyond the normal one, only
+# for borderline jobs.
+FIT_SCORE_REVERIFY_PASSES = 3
+
 # While False (default), apply_to_job() stops and flags for manual review
 # the moment Naukri's apply-flow chatbot asks a screening question — it
 # never fills in or clicks anything in that chatbot. Only when explicitly

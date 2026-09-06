@@ -60,7 +60,9 @@ def run_scoring_cycle():
         return
 
     for job in unscored:
-        result = scoring.score_job(job.get("description") or "", resume_profile, resume_embedding=resume_embedding)
+        result = scoring.score_job_with_reverification(
+            job.get("description") or "", resume_profile, resume_embedding=resume_embedding
+        )
         storage.upsert_job(
             {
                 "job_id": job["job_id"],

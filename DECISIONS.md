@@ -1661,3 +1661,57 @@ answer "when did I last run each cycle."
 
 **Tradeoff:** None significant — small, purely additive, zero new safety
 surface (this table only records that a cycle ran, never what it did).
+
+---
+
+## 2026-09-06 — Fit-score gray-zone re-verification (roadmap item 2)
+
+**Decision:** Added `scoring.score_job_with_reverification()`, now called
+by `orchestrator.run_scoring_cycle()` instead of `scoring.score_job()`
+directly. A job's first-pass `fit_score` is trusted as-is when it falls
+outside `config.FIT_SCORE_THRESHOLD (70) ± config.FIT_SCORE_REVERIFY_MARGIN
+(10)`. Inside that [60, 80] gray zone, the same job is re-scored
+`config.FIT_SCORE_REVERIFY_PASSES - 1` (2) more times and the average of
+all successful passes (rounded) becomes the final `fit_score`;
+`recommend_apply` is recomputed from that average against the threshold
+directly, not voted on separately. A first-pass transport failure
+(`fit_score=None`) returns immediately, nothing to re-verify; a
+re-verify pass that fails transiently is excluded from the average
+rather than aborting it; if every re-verify pass fails, the untouched
+first-pass score is returned and a warning is logged.
+
+**Context:** `JOB_SEARCH_STRATEGY.md` roadmap item 2. Live scoring runs
+this session showed single-pass LLM-judge `fit_score` values clustering
+at multiples of 5 near the threshold — a reproducible precision
+artifact of the judge model, not genuine fine-grained discrimination
+between e.g. 65 and 75. A hard cutoff at exactly 70 was therefore
+letting one noisy sample decide apply/no-apply for jobs that are
+genuinely borderline. Of the options presented, the user picked (c):
+keep a single hard threshold for the auto-apply decision itself, but
+don't trust one sample near it — automatically re-score borderline jobs
+2-3x and gate on the average.
+
+**Alternatives considered:**
+- (a) Widen the auto-apply band into an explicit "maybe" tier surfaced
+  for manual review, no re-scoring — rejected by the user: adds a
+  manual-triage step rather than making the existing signal more
+  reliable.
+- (b) Lower `EMBED_SIMILARITY_FLOOR` or otherwise tune the single-pass
+  prompt to reduce clustering — rejected: treats a symptom of the
+  judge's coarse resolution, doesn't fix the underlying one-sample
+  noise problem, and risks new miscalibration elsewhere.
+- Reusing the first pass's resume/job embedding + cosine-similarity
+  value across re-verify passes instead of recomputing via `score_job()`
+  each time — rejected: those calls are cheap relative to the LLM
+  scoring call, and only a minority of jobs (the gray-zone ones) ever
+  pay for re-verification at all; reusing state here would couple this
+  function to `score_job()`'s internals for a savings that doesn't
+  matter at this scale.
+
+**Tradeoff:** 2 extra LLM calls per gray-zone job only (most jobs score
+clearly above or below the band and pay nothing extra). `fit_score` for
+a re-verified job is now an average across passes rather than a single
+model call, which is intentionally less reproducible run-to-run for a
+job that's genuinely near the threshold — that's the point: a single
+noisy sample is what the researched clustering behavior showed was
+unreliable near 70 in the first place.

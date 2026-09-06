@@ -14,6 +14,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import config
 import scoring
 
 
@@ -247,6 +248,97 @@ class ResumeEmbeddingReuseTest(unittest.TestCase):
         ):
             scoring.score_job("some job description", "some resume")
         self.assertEqual(mock_embed.call_count, 2)  # job_description AND resume_profile
+
+
+class ScoreJobWithReverificationTest(unittest.TestCase):
+    """Fit-score gray-zone re-verification, added 2026-09-06 (see
+    DECISIONS.md and JOB_SEARCH_STRATEGY.md roadmap item 2). Assumes the
+    project defaults: FIT_SCORE_THRESHOLD=70, FIT_SCORE_REVERIFY_MARGIN=10
+    (gray zone [60, 80]), FIT_SCORE_REVERIFY_PASSES=3 (2 extra calls)."""
+
+    def setUp(self):
+        self.assertEqual(config.FIT_SCORE_THRESHOLD, 70, "tests assume the default threshold")
+        self.assertEqual(config.FIT_SCORE_REVERIFY_MARGIN, 10, "tests assume the default margin")
+        self.assertEqual(config.FIT_SCORE_REVERIFY_PASSES, 3, "tests assume the default pass count")
+
+    def _pass(self, fit_score):
+        return {"fit_score": fit_score, "reason": f"reason for {fit_score}", "recommend_apply": fit_score >= 70}
+
+    def test_score_clearly_above_gray_zone_is_trusted_on_first_pass(self):
+        with patch.object(scoring, "score_job", return_value=self._pass(95)) as mock_score_job:
+            result = scoring.score_job_with_reverification("jd", "resume")
+        mock_score_job.assert_called_once()
+        self.assertEqual(result, self._pass(95))
+
+    def test_score_clearly_below_gray_zone_is_trusted_on_first_pass(self):
+        with patch.object(scoring, "score_job", return_value=self._pass(30)) as mock_score_job:
+            result = scoring.score_job_with_reverification("jd", "resume")
+        mock_score_job.assert_called_once()
+        self.assertEqual(result, self._pass(30))
+
+    def test_score_at_threshold_triggers_reverification_and_averages(self):
+        with patch.object(
+            scoring, "score_job", side_effect=[self._pass(70), self._pass(80), self._pass(90)]
+        ) as mock_score_job:
+            result = scoring.score_job_with_reverification("jd", "resume")
+        self.assertEqual(mock_score_job.call_count, 3)
+        self.assertEqual(result["fit_score"], 80)  # (70+80+90)/3 = 80
+        self.assertTrue(result["recommend_apply"])  # 80 >= 70
+        self.assertIn("re-verified across 3 passes", result["reason"])
+
+    def test_score_at_upper_margin_boundary_still_triggers_reverification(self):
+        # threshold + margin = 80 exactly -- inclusive, not just strictly inside
+        with patch.object(scoring, "score_job", return_value=self._pass(80)) as mock_score_job:
+            scoring.score_job_with_reverification("jd", "resume")
+        self.assertEqual(mock_score_job.call_count, 3)
+
+    def test_score_just_outside_upper_margin_boundary_skips_reverification(self):
+        with patch.object(scoring, "score_job", return_value=self._pass(81)) as mock_score_job:
+            scoring.score_job_with_reverification("jd", "resume")
+        mock_score_job.assert_called_once()
+
+    def test_averaged_score_below_threshold_does_not_recommend_apply(self):
+        with patch.object(scoring, "score_job", side_effect=[self._pass(65), self._pass(60), self._pass(60)]):
+            result = scoring.score_job_with_reverification("jd", "resume")
+        self.assertEqual(result["fit_score"], 62)  # round((65+60+60)/3) = round(61.67) = 62
+        self.assertFalse(result["recommend_apply"])  # 62 < 70
+
+    def test_first_pass_failure_returns_immediately_without_reverifying(self):
+        first_failure = {"fit_score": None, "reason": "embedding call failed: boom", "recommend_apply": False}
+        with patch.object(scoring, "score_job", return_value=first_failure) as mock_score_job:
+            result = scoring.score_job_with_reverification("jd", "resume")
+        mock_score_job.assert_called_once()
+        self.assertEqual(result, first_failure)
+
+    def test_some_reverify_passes_failing_transiently_averages_only_successes(self):
+        transient_failure = {"fit_score": None, "reason": "LLM call failed: timeout", "recommend_apply": False}
+        with patch.object(
+            scoring, "score_job", side_effect=[self._pass(70), transient_failure, self._pass(80)]
+        ) as mock_score_job:
+            result = scoring.score_job_with_reverification("jd", "resume")
+        self.assertEqual(mock_score_job.call_count, 3)
+        self.assertEqual(result["fit_score"], 75)  # (70+80)/2 = 75, the failed pass excluded
+        self.assertIn("re-verified across 2 passes", result["reason"])
+
+    def test_all_reverify_passes_failing_returns_first_pass_unchanged(self):
+        transient_failure = {"fit_score": None, "reason": "LLM call failed: timeout", "recommend_apply": False}
+        first_success = self._pass(70)
+        with patch.object(
+            scoring, "score_job", side_effect=[first_success, transient_failure, transient_failure]
+        ) as mock_score_job:
+            with self.assertLogs(scoring.log, level="WARNING") as logs:
+                result = scoring.score_job_with_reverification("jd", "resume")
+        self.assertEqual(mock_score_job.call_count, 3)
+        self.assertEqual(result, first_success)
+        self.assertTrue(any("every re-verification" in m for m in logs.output))
+
+    def test_resume_embedding_threaded_through_every_pass(self):
+        with patch.object(
+            scoring, "score_job", side_effect=[self._pass(70), self._pass(70), self._pass(70)]
+        ) as mock_score_job:
+            scoring.score_job_with_reverification("jd", "resume", resume_embedding=[1.0, 0.0])
+        for call in mock_score_job.call_args_list:
+            self.assertEqual(call.kwargs.get("resume_embedding"), [1.0, 0.0])
 
 
 if __name__ == "__main__":
