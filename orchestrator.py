@@ -2,6 +2,7 @@
 search, score, apply — are real and wired into main()."""
 
 import argparse
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -37,8 +38,16 @@ def run_search_cycle(keywords: str, location: str = ""):
     originals found earlier in this SAME batch, since one batch of
     search results can itself contain more than one repost of the same
     posting. A match sets duplicate_of, excluding it from
-    run_scoring_cycle() (see storage.get_unscored_jobs())."""
+    run_scoring_cycle() (see storage.get_unscored_jobs()).
+
+    Also records this (keywords, location) combo's run time (added
+    2026-09-06, roadmap item 4) so `search --auto` (see
+    run_search_cycle_auto()) can rotate through config.SEARCH_QUERIES by
+    least-recently-run — recorded here unconditionally, for every search
+    regardless of whether it was typed manually or auto-picked, so the
+    rotation state stays accurate either way."""
     storage.record_run("search")
+    storage.record_search_run(keywords, location)
     log.info("Searching for %r in %r...", keywords, location or "(any location)")
     already_known = storage.get_job_ids_with_description()
     jobs = naukri_client.search_jobs_with_details(keywords, location, skip_job_ids=already_known)
@@ -68,6 +77,45 @@ def run_search_cycle(keywords: str, location: str = ""):
         log.info("Saved job %s - %s at %s", job["job_id"], job["title"], job["company"])
 
     return jobs
+
+
+def _pick_least_recently_run_query(queries: list, run_times: dict) -> dict:
+    """Pure, no I/O. Picks the entry from `queries` whose (keywords,
+    location) pair has the oldest recorded run in `run_times` -- an entry
+    with NO recorded run at all sorts as older than anything with a real
+    timestamp, so a combo that's never been searched is always picked over
+    one that has, no matter how long ago. Ties (including multiple
+    never-run entries) keep `queries`' original order: Python's min() only
+    replaces its current pick on a STRICTLY smaller key, so the first
+    tied entry encountered wins -- no explicit tie-break needed. Added
+    2026-09-06, JOB_SEARCH_STRATEGY.md roadmap item 4."""
+    def sort_key(query):
+        ran_at = run_times.get((query["keywords"], query["location"]))
+        return (ran_at is not None, ran_at or "")
+
+    return min(queries, key=sort_key)
+
+
+def run_search_cycle_auto():
+    """`search --auto` entry point -- added 2026-09-06, JOB_SEARCH_STRATEGY.md
+    roadmap item 4. Picks the least-recently-run role/city combo from
+    config.SEARCH_QUERIES (see _pick_least_recently_run_query()) instead of
+    keywords/location being typed manually every time, so repeated
+    invocations (e.g. a scheduled/cron run) rotate through every real
+    target combo automatically rather than only ever hitting whichever one
+    a human happened to type most often."""
+    if not config.SEARCH_QUERIES:
+        log.error("config.SEARCH_QUERIES is empty - nothing to rotate through. Pass keywords/location manually instead.")
+        return
+
+    run_times = storage.get_search_run_times()
+    query = _pick_least_recently_run_query(config.SEARCH_QUERIES, run_times)
+    log.info(
+        "search --auto picked %r in %r (least recently run).",
+        query["keywords"],
+        query["location"] or "(any location)",
+    )
+    return run_search_cycle(query["keywords"], query["location"])
 
 
 def run_scoring_cycle():
@@ -265,6 +313,23 @@ def run_apply_cycle(live: bool = False):
         # key the cache on (question, answer) alone. See scoring.py.
         verification_cache: dict = {}
 
+        # Cross-cycle counterpart to verification_cache above -- added
+        # 2026-09-06, JOB_SEARCH_STRATEGY.md roadmap item 3: Naukri repeats
+        # the same standard questions across DIFFERENT cycles/days too, not
+        # just within one, so a durable store (storage.screening_answers)
+        # skips a redundant verification call for those repeats as well.
+        # Closed over resume_hash (computed once here, not per job — mirrors
+        # resume_embedding above) so an edited resume.md can never have its
+        # old verdicts silently reused against the new content — see
+        # storage.get_screening_answer_verification's docstring. scoring.py
+        # only ever sees these two plain callables, never storage.py itself
+        # (module boundary rule — see README.md).
+        durable_lookup = durable_save = None
+        if config.AUTO_ANSWER_SCREENING_QUESTIONS:
+            resume_hash = hashlib.sha256(resume_profile.encode()).hexdigest()
+            durable_lookup = lambda q, a: storage.get_screening_answer_verification(q, a, resume_hash)
+            durable_save = lambda q, a, v: storage.save_screening_answer_verification(q, a, resume_hash, v)
+
         consecutive_applies = 0
         recent_applies: list = []
 
@@ -280,7 +345,13 @@ def run_apply_cycle(live: bool = False):
                 # description — see scoring.draft_screening_answer.
                 job_description = job.get("description") or ""
                 answer_fn = lambda question, options, jd=job_description: scoring.draft_screening_answer(
-                    question, options, resume_profile, jd, cache=verification_cache
+                    question,
+                    options,
+                    resume_profile,
+                    jd,
+                    cache=verification_cache,
+                    durable_lookup=durable_lookup,
+                    durable_save=durable_save,
                 )
 
             try:
@@ -450,8 +521,18 @@ def main():
     subparsers = parser.add_subparsers(dest="cycle", required=True)
 
     search_parser = subparsers.add_parser("search", help="search + scrape new jobs")
-    search_parser.add_argument("keywords", help='e.g. "python developer"')
+    search_parser.add_argument(
+        "keywords", nargs="?", default=None, help='e.g. "python developer" (omit when using --auto)'
+    )
     search_parser.add_argument("location", nargs="?", default="", help='e.g. "Bangalore"')
+    search_parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "pick the least-recently-searched role/city combo from "
+            "config.SEARCH_QUERIES instead of typing keywords/location manually"
+        ),
+    )
 
     subparsers.add_parser("score", help="score unscored jobs against resume.md")
 
@@ -477,7 +558,14 @@ def main():
     storage.init_db()
 
     if args.cycle == "search":
-        run_search_cycle(args.keywords, args.location)
+        if args.auto:
+            if args.keywords is not None:
+                search_parser.error("keywords/location can't be combined with --auto")
+            run_search_cycle_auto()
+        elif args.keywords is None:
+            search_parser.error("keywords is required unless --auto is passed")
+        else:
+            run_search_cycle(args.keywords, args.location)
     elif args.cycle == "score":
         run_scoring_cycle()
     elif args.cycle == "apply":

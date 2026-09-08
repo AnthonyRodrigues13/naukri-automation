@@ -1788,3 +1788,119 @@ reposts with more heavily edited descriptions won't be caught (accepted
 `scored` counts had to be recomputed directly rather than derived via
 subtraction, now that duplicates are excluded from one but included in
 `total_jobs`.
+
+---
+
+## 2026-09-06 — Cross-cycle screening-answer memory (roadmap item 3), notice-period hard-skip rejected again
+
+**Decision:** `_verify_screening_answer()` and `draft_screening_answer()`
+now accept two optional callables, `durable_lookup`/`durable_save`,
+checked/populated after the existing in-memory `cache` (see the
+2026-09-06 verification-cache entry). `run_apply_cycle()` wires these to
+new `storage.get_screening_answer_verification()`/
+`save_screening_answer_verification()` functions backed by a new
+`screening_answers` table, keyed on `(question, answer, resume_hash)` —
+`resume_hash` (`hashlib.sha256(resume_profile).hexdigest()`, computed
+once per cycle) means a verdict recorded against one version of
+`resume.md` is simply invisible after the file is edited, never silently
+misapplied to the new content. `scoring.py` never imports `storage.py`
+directly (module boundary rule) — it only ever sees the two plain
+callables, exactly the same pattern already used for `answer_fn` reaching
+`naukri_client.py`.
+
+**Also decided: the notice-period hard-skip half of this roadmap item was
+NOT implemented.** `JOB_SEARCH_STRATEGY.md`'s roadmap item 3 proposed
+hard-coding the same "always skip rather than guess the closest label"
+keyword gate used for salary/CTC, for notice-period questions too. Before
+implementing, re-read this file's own 2026-09-01 entry ("Fixed via a
+verification pass, not more prompt instructions") and found it had
+already considered and explicitly rejected exactly this fix, for exactly
+this failure mode: "there's no clean keyword signal for 'this option
+might be a lexical false-friend' the way 'mentions ctc' is a clean signal
+for 'don't calibrate a number' — the failure is specific to *which*
+option got picked, not the topic of the question." The fix that *was*
+built instead (a second independent verification pass) was live-verified
+at the time to catch all 4 reproduced bad cases with zero false positives
+across a 9-case regression suite — evidence a blanket keyword gate has
+never been shown to match. Surfaced this conflict to the user rather than
+silently picking a side; the user chose to skip the hard-skip and keep
+only the persistence half of this item.
+
+**Context:** Naukri visibly reuses standard screening questions verbatim
+across postings (see the Yellowblock/Coffeebeans examples elsewhere in
+this file) — the existing `verification_cache` only ever helped within
+one `run_apply_cycle()` invocation, so the exact same question recurring
+in tomorrow's cycle paid for a full independent LLM verification call
+again, for a judgment already made.
+
+**Alternatives considered:**
+- Keying the durable cache on `(question, answer)` alone, matching the
+  in-memory cache exactly — rejected: the in-memory cache's docstring
+  explicitly notes `resume_profile` is safe to omit from the key only
+  because it's fixed *for the cache's entire lifetime* (one process run).
+  A durable cache's lifetime spans across resume.md edits, so that
+  assumption doesn't carry over — `resume_hash` was added specifically
+  to preserve it.
+- A hard keyword-based skip for notice-period questions, as literally
+  proposed in the roadmap doc — rejected, see above.
+- A blanket hard-skip covering ALL notice-period-mentioning questions
+  regardless of `options` (matching the CTC gate's unconditional style
+  exactly) — also considered and rejected as part of the same
+  conversation: CTC's problem (generating/calibrating a NEW number) exists
+  in both free-text and fixed-option forms, but the notice-period failure
+  is specific to mapping a resume fact onto one of several FIXED LABELS;
+  free-text notice-period questions are already answered reliably (see
+  README's Safety notes) and a blanket skip would have regressed that
+  working path for no evidenced benefit.
+
+**Tradeoff:** None significant for the persistence half — purely
+additive, a miss just falls through to the existing (already-tested)
+LLM verification path exactly as before. Deferring the notice-period
+hard-skip leaves that failure mode's ONLY defense as the verification
+pass — accepted, since that defense already has verified evidence behind
+it and the alternative had none.
+
+---
+
+## 2026-09-06 — Search-term/location rotation (roadmap item 4)
+
+**Decision:** Added `config.SEARCH_QUERIES` (a list of `{keywords,
+location}` dicts — 2 role identities x 4 target cities from
+`JOB_SEARCH_STRATEGY.md`'s own findings, editable), a new `search_runs`
+table (`storage.record_search_run()`/`get_search_run_times()`), and a
+pure `orchestrator._pick_least_recently_run_query()` that picks whichever
+`SEARCH_QUERIES` entry has gone longest without being searched (never-run
+beats any recorded run, regardless of age). `python orchestrator.py
+search --auto` uses this instead of requiring `keywords`/`location` to be
+typed manually — `run_search_cycle()` itself now records every search's
+`(keywords, location)` unconditionally (manual or `--auto`), so rotation
+state stays accurate either way.
+
+**Context:** `JOB_SEARCH_STRATEGY.md` roadmap item 4 — replacing manually
+retyping the same handful of role/city combos with a rotation that
+actually covers all of them over repeated invocations (e.g. a
+scheduled/cron run), instead of only ever hitting whichever one gets
+typed most often.
+
+**Alternatives considered:**
+- Round-robin by fixed order (cycle through `SEARCH_QUERIES` in sequence,
+  tracking only an index) instead of least-recently-run by timestamp —
+  rejected: a fixed-order cycle can't recover gracefully if a run is
+  skipped or a new entry is added mid-rotation (the index drifts out of
+  sync with intent), whereas least-recently-run self-corrects from
+  whatever state `search_runs` is actually in.
+- Deriving "least recently searched" from `jobs.scraped_at` (already
+  present per-job) instead of a new table — rejected for the same reason
+  cadence tracking (roadmap item 5) rejected it: a search that finds zero
+  new jobs (everything already known) leaves no new `scraped_at` row,
+  which would make a combo that WAS just searched look identical to one
+  that's never been touched.
+
+**Tradeoff:** None significant — purely additive, and manually-typed
+`search` invocations are completely unaffected in behavior (they still
+work exactly as before; they're just also now recorded for `--auto`'s
+benefit). **Live-verified** 2026-09-06/07 against the real site: with no
+prior `search_runs` history, `search --auto` picked the first
+`SEARCH_QUERIES` entry (all tied at "never run") and completed a real
+search (20 jobs found, 6 new), then correctly recorded that combo's run
+time.

@@ -14,6 +14,7 @@ Ollama, or database writes. Confirmation prompts are patched directly
 input()-wrapping helper itself.
 """
 
+import hashlib
 import json
 import sys
 import unittest
@@ -38,17 +39,26 @@ import storage
 # jobs.db's run_history table. RecordRunWiringTest below overrides this
 # locally (nested patches compose correctly) to verify the actual call
 # args per cycle.
+#
+# storage.record_search_run() (added 2026-09-06 for search-query rotation,
+# roadmap item 4) is called unconditionally at the top of run_search_cycle()
+# the same way -- patched module-wide for the same reason. RecordRunWiringTest
+# overrides it locally too where it matters.
 _record_run_patcher = None
+_record_search_run_patcher = None
 
 
 def setUpModule():
-    global _record_run_patcher
+    global _record_run_patcher, _record_search_run_patcher
     _record_run_patcher = patch.object(storage, "record_run")
     _record_run_patcher.start()
+    _record_search_run_patcher = patch.object(storage, "record_search_run")
+    _record_search_run_patcher.start()
 
 
 def tearDownModule():
     _record_run_patcher.stop()
+    _record_search_run_patcher.stop()
 
 
 FAKE_JOB = {
@@ -141,6 +151,63 @@ class RunApplyCycleLiveFlagTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator.run_apply_cycle(live=True)
         self.assertFalse(config.DRY_RUN)  # restored even though the function raised
+
+
+class RunApplyCycleDurableScreeningCacheTest(unittest.TestCase):
+    """Cross-cycle screening-answer memory, added 2026-09-06 (see
+    DECISIONS.md and JOB_SEARCH_STRATEGY.md roadmap item 3): run_apply_cycle()
+    wires storage.get/save_screening_answer_verification in as
+    scoring.draft_screening_answer's durable_lookup/durable_save hooks,
+    closed over a hash of resume_profile computed once per cycle."""
+
+    def setUp(self):
+        self._original_dry_run = config.DRY_RUN
+        self._original_paused = config.PAUSED
+        self._original_auto_answer = config.AUTO_ANSWER_SCREENING_QUESTIONS
+        config.DRY_RUN = True
+        config.PAUSED = False
+        config.AUTO_ANSWER_SCREENING_QUESTIONS = True
+
+    def tearDown(self):
+        config.DRY_RUN = self._original_dry_run
+        config.PAUSED = self._original_paused
+        config.AUTO_ANSWER_SCREENING_QUESTIONS = self._original_auto_answer
+
+    def test_answer_fn_threads_durable_hooks_backed_by_storage_keyed_on_resume_hash(self):
+        captured = {}
+
+        def fake_apply_to_job(job_id, url, answer_fn=None):
+            captured["answer_fn"] = answer_fn
+            return {"applied": False, "reason": "dry_run", "qa_log": []}
+
+        with patch.object(storage, "count_applications_today", return_value=0), patch.object(
+            storage, "get_applicable_jobs", return_value=[dict(FAKE_JOB)]
+        ), patch.object(naukri_client, "apply_to_job", side_effect=fake_apply_to_job), patch.object(
+            excel_log, "log_application"
+        ), patch.object(storage, "mark_applied"), patch.object(storage, "upsert_job"), patch.object(
+            scoring, "load_resume_profile", return_value="resume text"
+        ), patch.object(
+            storage, "get_screening_answer_verification", return_value=True
+        ) as mock_get_verification, patch.object(
+            storage, "save_screening_answer_verification"
+        ), patch.object(
+            scoring, "_call_screening_llm", return_value="Yes"
+        ):
+            orchestrator.run_apply_cycle(live=False)
+
+            # Called while the patches above are still active -- answer_fn
+            # is a closure over run_apply_cycle's local scope, so calling it
+            # after this `with` block exits would hit the REAL (unpatched)
+            # scoring/storage functions instead of these mocks.
+            answer_fn = captured["answer_fn"]
+            result = answer_fn("Notice period?", ["Yes", "No"])
+
+        self.assertEqual(result, "Yes")
+        expected_hash = hashlib.sha256("resume text".encode()).hexdigest()
+        # A durable hit means _verify_screening_answer never had to make a
+        # real LLM verification call at all -- storage.get_screening_answer_verification
+        # was reached with the correct (question, answer, resume_hash).
+        mock_get_verification.assert_called_once_with("Notice period?", "Yes", expected_hash)
 
 
 class PreflightConfirmationTest(unittest.TestCase):
@@ -420,9 +487,12 @@ class RecordRunWiringTest(unittest.TestCase):
             storage, "get_job_ids_with_description", return_value=set()
         ), patch.object(naukri_client, "search_jobs_with_details", return_value=[]), patch.object(
             storage, "upsert_job"
-        ), patch.object(storage, "get_original_job_embeddings", return_value=[]):
+        ), patch.object(storage, "get_original_job_embeddings", return_value=[]), patch.object(
+            storage, "record_search_run"
+        ) as mock_record_search_run:
             orchestrator.run_search_cycle("python developer", "Pune")
         mock_record_run.assert_called_once_with("search")
+        mock_record_search_run.assert_called_once_with("python developer", "Pune")
 
     def test_scoring_cycle_records_score(self):
         with patch.object(storage, "record_run") as mock_record_run, patch.object(
@@ -537,6 +607,78 @@ class RunSearchCycleDuplicateDetectionTest(unittest.TestCase):
         )
         self.assertNotIn("duplicate_of", upserted[0])
         self.assertNotIn("description_embedding", upserted[0])
+
+
+class PickLeastRecentlyRunQueryTest(unittest.TestCase):
+    """Search-term/location rotation, added 2026-09-06 (see DECISIONS.md
+    and JOB_SEARCH_STRATEGY.md roadmap item 4). Pure function -- no I/O,
+    no mocking needed."""
+
+    def test_a_never_run_entry_beats_one_with_any_recorded_run(self):
+        queries = [
+            {"keywords": "A", "location": "X"},
+            {"keywords": "B", "location": "Y"},
+        ]
+        run_times = {("A", "X"): "2026-01-01T00:00:00"}  # B/Y never run
+        result = orchestrator._pick_least_recently_run_query(queries, run_times)
+        self.assertEqual(result, {"keywords": "B", "location": "Y"})
+
+    def test_among_run_entries_the_oldest_is_picked(self):
+        queries = [
+            {"keywords": "A", "location": "X"},
+            {"keywords": "B", "location": "Y"},
+        ]
+        run_times = {
+            ("A", "X"): "2026-01-05T00:00:00",
+            ("B", "Y"): "2026-01-01T00:00:00",  # older -> more overdue
+        }
+        result = orchestrator._pick_least_recently_run_query(queries, run_times)
+        self.assertEqual(result, {"keywords": "B", "location": "Y"})
+
+    def test_ties_among_never_run_entries_keep_original_order(self):
+        queries = [
+            {"keywords": "A", "location": "X"},
+            {"keywords": "B", "location": "Y"},
+        ]
+        result = orchestrator._pick_least_recently_run_query(queries, {})
+        self.assertEqual(result, {"keywords": "A", "location": "X"})
+
+    def test_single_query_is_always_picked(self):
+        queries = [{"keywords": "A", "location": "X"}]
+        result = orchestrator._pick_least_recently_run_query(queries, {("A", "X"): "2026-01-01T00:00:00"})
+        self.assertEqual(result, {"keywords": "A", "location": "X"})
+
+
+class RunSearchCycleAutoTest(unittest.TestCase):
+    """`search --auto`, added 2026-09-06 (see DECISIONS.md and
+    JOB_SEARCH_STRATEGY.md roadmap item 4)."""
+
+    def setUp(self):
+        self._original_queries = config.SEARCH_QUERIES
+
+    def tearDown(self):
+        config.SEARCH_QUERIES = self._original_queries
+
+    def test_picks_the_least_recently_run_query_and_delegates_to_run_search_cycle(self):
+        config.SEARCH_QUERIES = [
+            {"keywords": "AI Engineer", "location": "Pune"},
+            {"keywords": "WordPress Developer", "location": "Goa"},
+        ]
+        with patch.object(
+            storage,
+            "get_search_run_times",
+            return_value={("AI Engineer", "Pune"): "2026-01-01T00:00:00"},  # WordPress/Goa never run
+        ), patch.object(orchestrator, "run_search_cycle", return_value=["job"]) as mock_run_search_cycle:
+            result = orchestrator.run_search_cycle_auto()
+
+        mock_run_search_cycle.assert_called_once_with("WordPress Developer", "Goa")
+        self.assertEqual(result, ["job"])
+
+    def test_empty_search_queries_does_nothing(self):
+        config.SEARCH_QUERIES = []
+        with patch.object(orchestrator, "run_search_cycle") as mock_run_search_cycle:
+            orchestrator.run_search_cycle_auto()
+        mock_run_search_cycle.assert_not_called()
 
 
 class FormatTimeAgoTest(unittest.TestCase):

@@ -136,6 +136,40 @@ per job, so a session that expires mid-run wouldn't be caught until the next
 (seconds, not minutes) that a mid-run expiry is far less likely than it was
 in the multi-minute version.
 
+### `search --auto` / `run_search_cycle_auto()` — orchestrator.py
+
+Added 2026-09-06, JOB_SEARCH_STRATEGY.md roadmap item 4 — an alternative
+entry point to typing `keywords`/`location` manually every time:
+
+```
+run_search_cycle_auto
+ ├─ config.SEARCH_QUERIES empty? log.error(...), return   # nothing to rotate through
+ ├─ run_times = storage.get_search_run_times()   # {(keywords, location): ran_at, ...}
+ ├─ query = _pick_least_recently_run_query(config.SEARCH_QUERIES, run_times)   # PURE
+ │   └─ min() over config.SEARCH_QUERIES, keyed on (has_a_recorded_run, ran_at) --
+ │      a never-run combo sorts before ANY recorded run, no matter how old;
+ │      among recorded runs, the oldest (most overdue) wins; ties keep
+ │      config.SEARCH_QUERIES' original list order (min() only replaces on a
+ │      STRICTLY smaller key)
+ └─ run_search_cycle(query["keywords"], query["location"])   # same function
+       `search <keywords> <location>` already used -- --auto only changes
+       HOW keywords/location are chosen, not what happens once they are
+```
+
+`run_search_cycle()` itself now also calls `storage.record_search_run(keywords, location)`
+unconditionally, right alongside the existing `storage.record_run("search")` —
+recorded for EVERY search (typed manually or `--auto`-picked), so rotation
+state stays accurate regardless of how a search was invoked. `main()`'s CLI
+parsing makes `keywords` optional (`nargs="?"`) and adds `--auto`; passing
+both `keywords` and `--auto` together, or neither, is a `parser.error()` —
+fails closed rather than silently guessing which one was meant.
+
+**Live-verified** 2026-09-06/07: with `search_runs` empty, `search --auto`
+correctly picked the first entry in `config.SEARCH_QUERIES` (all tied at
+"never run," list order preserved) and ran a real search against Naukri
+(20 jobs found, 6 genuinely new), then correctly recorded that combo's
+run time.
+
 ## `run_scoring_cycle()` — orchestrator.py
 
 ```
@@ -295,7 +329,7 @@ run_apply_cycle(live)
 
 `answer_fn` is built **per job**, inside the `run_apply_cycle()` loop, only
 when `config.AUTO_ANSWER_SCREENING_QUESTIONS` is `True`:
-`lambda question, options, jd=job_description: scoring.draft_screening_answer(question, options, resume_profile, jd, cache=verification_cache)`
+`lambda question, options, jd=job_description: scoring.draft_screening_answer(question, options, resume_profile, jd, cache=verification_cache, durable_lookup=durable_lookup, durable_save=durable_save)`
 — per-job (not built once outside the loop) so `job_description` can be
 bound per closure, letting `draft_screening_answer` see each job's own
 description. This is how the LLM call in `scoring.py` reaches
@@ -310,6 +344,25 @@ once outside the loop, right alongside `resume_profile` — the opposite of
 questions verbatim across postings, so a repeat within one cycle skips a
 redundant verification LLM call. Never persisted across process runs —
 recreated fresh every `run_apply_cycle()` call.
+
+`durable_lookup`/`durable_save` (added 2026-09-06, roadmap item 3 — see
+DECISIONS.md) are also built once outside the loop, only when
+`AUTO_ANSWER_SCREENING_QUESTIONS` is `True`:
+```
+resume_hash = hashlib.sha256(resume_profile.encode()).hexdigest()
+durable_lookup = lambda q, a: storage.get_screening_answer_verification(q, a, resume_hash)
+durable_save   = lambda q, a, v: storage.save_screening_answer_verification(q, a, resume_hash, v)
+```
+These extend `verification_cache` beyond one cycle into `storage`'s
+`screening_answers` table — the same "Naukri reuses questions verbatim"
+reasoning as `verification_cache`, but across DIFFERENT cycles/days, not
+just within one. `scoring.py` only ever sees these two plain callables,
+never `storage` itself — the module boundary rule (`naukri_client.py`/
+`scoring.py`/`storage.py` never import each other) applies here exactly
+like it does for `answer_fn` reaching `naukri_client.py` above.
+`resume_hash` is what keeps this safe across an edited `resume.md`: a
+verdict recorded under the OLD content's hash is simply never matched
+against a NEW hash, so it can't be silently misapplied.
 
 ### `_handle_screening_chatbot(page, job_id, answer_fn)` — naukri_client.py
 
@@ -415,6 +468,22 @@ option lists; more prompt instructions made zero measurable difference,
 same lesson as expected-CTC calibration). Free-text answers skip this
 second call. Roughly doubles latency for fixed-option answers — accepted
 per explicit instruction to prioritize completeness over speed.
+
+Before making that real LLM call, `_verify_screening_answer()` checks (in
+order) the in-memory `cache` dict, then — added 2026-09-06, roadmap item
+3 — `durable_lookup(question, answer)`. A hit at either layer skips the
+LLM call entirely and (for a durable hit) back-fills the in-memory cache
+too, so the rest of THIS cycle also benefits. A real LLM verification
+(not a transient failure) populates both `cache` and, via `durable_save`,
+`storage`'s `screening_answers` table — see the note on `run_apply_cycle`'s
+`durable_lookup`/`durable_save` construction above. `JOB_SEARCH_STRATEGY.md`
+roadmap item 3 also proposed a hard keyword-based skip for notice-period
+questions, mirroring the salary/CTC gate below — deliberately NOT built:
+`DECISIONS.md`'s 2026-09-01 entry already considered and rejected that
+exact fix for this exact failure (no clean keyword signal for "this
+option is a lexical false-friend," unlike "mentions ctc"), and the
+verification pass documented in this paragraph was verified to catch it
+instead (9/9 regression cases, no false positives).
 
 A free-text (no-options) answer instead passes through
 `_clean_free_text_answer(raw, question)` before being returned — strips a

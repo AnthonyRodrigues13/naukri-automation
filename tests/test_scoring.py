@@ -175,6 +175,56 @@ class VerifyScreeningAnswerCacheTest(unittest.TestCase):
         self.assertEqual(result2, "Yes")
         mock_post.assert_called_once()  # verification cached on the second, identical call
 
+    def test_durable_lookup_hit_skips_the_llm_call_and_backfills_in_memory_cache(self):
+        cache = {}
+        with patch.object(scoring.requests, "post") as mock_post:
+            durable_lookup = MagicMock(return_value=True)
+            result = scoring._verify_screening_answer(
+                "Q1", "A1", "resume", cache=cache, durable_lookup=durable_lookup
+            )
+        self.assertTrue(result)
+        mock_post.assert_not_called()
+        durable_lookup.assert_called_once_with("Q1", "A1")
+        self.assertEqual(cache[("Q1", "A1")], True)  # backfilled for the rest of THIS cycle too
+
+    def test_durable_lookup_miss_falls_through_to_a_real_llm_call(self):
+        durable_lookup = MagicMock(return_value=None)
+        with patch.object(scoring.requests, "post", return_value=_mock_verify_response("YES")) as mock_post:
+            result = scoring._verify_screening_answer("Q1", "A1", "resume", durable_lookup=durable_lookup)
+        self.assertTrue(result)
+        mock_post.assert_called_once()
+
+    def test_in_memory_cache_is_checked_before_durable_lookup(self):
+        cache = {("Q1", "A1"): True}
+        durable_lookup = MagicMock()
+        result = scoring._verify_screening_answer("Q1", "A1", "resume", cache=cache, durable_lookup=durable_lookup)
+        self.assertTrue(result)
+        durable_lookup.assert_not_called()
+
+    def test_a_real_llm_verification_populates_durable_save(self):
+        durable_save = MagicMock()
+        with patch.object(scoring.requests, "post", return_value=_mock_verify_response("YES")):
+            scoring._verify_screening_answer("Q1", "A1", "resume", durable_lookup=lambda q, a: None, durable_save=durable_save)
+        durable_save.assert_called_once_with("Q1", "A1", True)
+
+    def test_transient_failure_does_not_call_durable_save(self):
+        durable_save = MagicMock()
+        with patch.object(scoring.requests, "post", side_effect=requests.RequestException("boom")):
+            scoring._verify_screening_answer(
+                "Q1", "A1", "resume", durable_lookup=lambda q, a: None, durable_save=durable_save
+            )
+        durable_save.assert_not_called()
+
+    def test_draft_screening_answer_threads_durable_hooks_through_to_verification(self):
+        durable_lookup = MagicMock(return_value=True)
+        durable_save = MagicMock()
+        with patch.object(scoring, "_call_screening_llm", return_value="Yes"):
+            result = scoring.draft_screening_answer(
+                "Q1", ["Yes", "No"], "resume", durable_lookup=durable_lookup, durable_save=durable_save
+            )
+        self.assertEqual(result, "Yes")
+        durable_lookup.assert_called_once_with("Q1", "Yes")
+
 
 class MalformedOllamaResponseTest(unittest.TestCase):
     """Added 2026-09-06: a 200 OK response with an unexpected body (e.g.

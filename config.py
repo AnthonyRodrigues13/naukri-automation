@@ -125,3 +125,23 @@ OLLAMA_MODELS = {
 }
 
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+# --- Search targeting — `python orchestrator.py search --auto` rotates through
+# these instead of keywords/location being typed manually every time ---
+
+# Each entry is one role/city combo to search. `search --auto` picks
+# whichever entry's (keywords, location) pair was searched least recently
+# (or never) — see orchestrator._pick_least_recently_run_query() and
+# storage.get_search_run_times(). Added 2026-09-06, JOB_SEARCH_STRATEGY.md
+# roadmap item 4. Edit this list to match your actual target roles/cities —
+# these are a starting point, not a fixed set.
+SEARCH_QUERIES = [
+    {"keywords": "AI Engineer", "location": "Bangalore"},
+    {"keywords": "AI Engineer", "location": "Pune"},
+    {"keywords": "AI Engineer", "location": "Hyderabad"},
+    {"keywords": "AI Engineer", "location": "Goa"},
+    {"keywords": "WordPress Developer", "location": "Bangalore"},
+    {"keywords": "WordPress Developer", "location": "Pune"},
+    {"keywords": "WordPress Developer", "location": "Hyderabad"},
+    {"keywords": "WordPress Developer", "location": "Goa"},
+]

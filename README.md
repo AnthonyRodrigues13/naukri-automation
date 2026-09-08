@@ -50,6 +50,19 @@ or applied to independently. Inspect results with:
 sqlite3 jobs.db "select title, company, url from jobs;"
 ```
 
+Instead of typing `keywords`/`location` every time, `search --auto` picks
+the least-recently-searched role/city combo from `config.SEARCH_QUERIES`
+(edit that list to match your actual target roles/cities):
+
+```
+python orchestrator.py search --auto
+```
+
+A combo that's never been searched is always picked before one that has,
+no matter how long ago; repeated invocations (e.g. a scheduled/cron run)
+rotate through every combo in the list rather than only ever hitting
+whichever one gets typed most often.
+
 Then score the scraped jobs against `resume.md`:
 
 ```
@@ -124,8 +137,14 @@ this happens, not silently dropped).
   *always* skipped regardless of resume content (see `DECISIONS.md` —
   numeric range calibration proved unreliable for this model); notice
   period and relocation are answered from `resume.md`'s Availability &
-  logistics section when it's filled in. Still, this is the highest-risk
-  switch in the codebase; flip it deliberately.
+  logistics section when it's filled in. A fixed-option (chip/radio)
+  answer is independently re-verified before being used, and Naukri
+  visibly repeats the same standard questions across postings, so a
+  question already verified once — even in a previous run, on a previous
+  day — is remembered (keyed to the current content of `resume.md`; an
+  edited resume never reuses an old verdict) rather than re-verified from
+  scratch every time. Still, this is the highest-risk switch in the
+  codebase; flip it deliberately.
 - Scoring itself doesn't trust a single sample near the threshold: a job
   whose `fit_score` lands within `config.FIT_SCORE_REVERIFY_MARGIN` (10
   by default) of `config.FIT_SCORE_THRESHOLD` is automatically re-scored

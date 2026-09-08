@@ -315,5 +315,86 @@ class GetStatusSummaryDuplicatesTest(unittest.TestCase):
         self.assertEqual(summary["duplicates_detected"], 0)
 
 
+class ScreeningAnswerVerificationTest(unittest.TestCase):
+    """Cross-cycle screening-answer memory, added 2026-09-06 (see
+    DECISIONS.md and JOB_SEARCH_STRATEGY.md roadmap item 3)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "test_jobs.db")
+        self._patcher = patch.object(config, "DB_PATH", self._db_path)
+        self._patcher.start()
+        storage.init_db()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_unrecorded_pair_returns_none(self):
+        self.assertIsNone(storage.get_screening_answer_verification("Q1", "A1", "hash1"))
+
+    def test_recorded_pair_is_returned(self):
+        storage.save_screening_answer_verification("Q1", "A1", "hash1", True)
+        self.assertTrue(storage.get_screening_answer_verification("Q1", "A1", "hash1"))
+
+    def test_recorded_false_verdict_is_returned_as_false_not_a_miss(self):
+        storage.save_screening_answer_verification("Q1", "A1", "hash1", False)
+        self.assertFalse(storage.get_screening_answer_verification("Q1", "A1", "hash1"))
+
+    def test_a_different_resume_hash_is_a_miss_even_for_the_same_question_and_answer(self):
+        # An edited resume.md must never silently reuse a verdict checked
+        # against the OLD content -- see the function's docstring.
+        storage.save_screening_answer_verification("Q1", "A1", "hash1", True)
+        self.assertIsNone(storage.get_screening_answer_verification("Q1", "A1", "hash2"))
+
+    def test_saving_again_overwrites_the_previous_verdict(self):
+        storage.save_screening_answer_verification("Q1", "A1", "hash1", True)
+        storage.save_screening_answer_verification("Q1", "A1", "hash1", False)
+        self.assertFalse(storage.get_screening_answer_verification("Q1", "A1", "hash1"))
+
+
+class SearchRunsTest(unittest.TestCase):
+    """Search-term/location rotation, added 2026-09-06 (see DECISIONS.md
+    and JOB_SEARCH_STRATEGY.md roadmap item 4)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "test_jobs.db")
+        self._patcher = patch.object(config, "DB_PATH", self._db_path)
+        self._patcher.start()
+        storage.init_db()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_never_run_combo_is_absent(self):
+        self.assertEqual(storage.get_search_run_times(), {})
+
+    def test_recorded_combo_is_returned(self):
+        storage.record_search_run("AI Engineer", "Pune")
+        result = storage.get_search_run_times()
+        self.assertIn(("AI Engineer", "Pune"), result)
+        datetime.fromisoformat(result[("AI Engineer", "Pune")])  # a real, parseable ISO timestamp
+
+    def test_multiple_combos_tracked_independently(self):
+        storage.record_search_run("AI Engineer", "Pune")
+        storage.record_search_run("WordPress Developer", "Goa")
+        result = storage.get_search_run_times()
+        self.assertIn(("AI Engineer", "Pune"), result)
+        self.assertIn(("WordPress Developer", "Goa"), result)
+        self.assertNotIn(("AI Engineer", "Goa"), result)
+
+    def test_recording_again_overwrites_the_previous_timestamp(self):
+        with patch.object(storage, "datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 1, 1, 10, 0, 0)
+            storage.record_search_run("AI Engineer", "Pune")
+            mock_datetime.now.return_value = datetime(2026, 1, 2, 10, 0, 0)
+            storage.record_search_run("AI Engineer", "Pune")
+
+        result = storage.get_search_run_times()
+        self.assertEqual(result[("AI Engineer", "Pune")], "2026-01-02T10:00:00")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -330,7 +330,14 @@ Does the resume specifically and accurately support this exact answer — not so
 Respond with exactly YES or NO. Nothing else."""
 
 
-def _verify_screening_answer(question: str, answer: str, resume_profile: str, cache: dict | None = None) -> bool:
+def _verify_screening_answer(
+    question: str,
+    answer: str,
+    resume_profile: str,
+    cache: dict | None = None,
+    durable_lookup=None,
+    durable_save=None,
+) -> bool:
     """`cache`, if given, is checked/populated for the exact (question,
     answer) pair before making a real LLM call. Naukri visibly reuses
     standard screening questions verbatim across postings (see
@@ -343,10 +350,36 @@ def _verify_screening_answer(question: str, answer: str, resume_profile: str, ca
     a (question, answer) pair means the same verification for the cache's
     entire lifetime. This does not reopen the doubled-latency-per-call
     tradeoff recorded below — every distinct (question, answer) pair still
-    gets verified at full rigor; only literal repeats are skipped."""
+    gets verified at full rigor; only literal repeats are skipped.
+
+    `durable_lookup`/`durable_save`, if given, extend this beyond one
+    process's in-memory `cache` into a store that survives across apply
+    cycles — added 2026-09-06, JOB_SEARCH_STRATEGY.md roadmap item 3, since
+    the in-memory cache above only ever helps within a single cycle, and
+    Naukri visibly repeats the same standard questions across separate
+    cycles/days too. Both are plain callables, not a direct storage.py
+    import: naukri_client.py/scoring.py/storage.py never import each other
+    (see README.md's module boundary rule) — orchestrator.py wires
+    storage.get_screening_answer_verification/save_screening_answer_verification
+    in as these two hooks, closed over a hash of resume.md's current
+    content computed once per apply cycle (so an edited resume never
+    silently reuses a verdict it was never actually checked against — see
+    storage's docstrings). `durable_lookup(question, answer) -> bool | None`
+    is checked after the in-memory cache (a miss there but a hit here still
+    skips the real LLM call, and back-fills the in-memory cache too).
+    `durable_save(question, answer, verdict)` is called alongside
+    populating the in-memory cache — never on a transient failure, same
+    reasoning as the in-memory cache below."""
     cache_key = (question, answer)
     if cache is not None and cache_key in cache:
         return cache[cache_key]
+
+    if durable_lookup is not None:
+        durable_verdict = durable_lookup(question, answer)
+        if durable_verdict is not None:
+            if cache is not None:
+                cache[cache_key] = durable_verdict
+            return durable_verdict
 
     prompt = VERIFY_ANSWER_PROMPT_TEMPLATE.format(
         resume_profile=resume_profile, question=question, answer=answer
@@ -383,11 +416,19 @@ def _verify_screening_answer(question: str, answer: str, resume_profile: str, ca
 
     if cache is not None:
         cache[cache_key] = verdict
+    if durable_save is not None:
+        durable_save(question, answer, verdict)
     return verdict
 
 
 def draft_screening_answer(
-    question: str, options: list[str] | None, resume_profile: str, job_description: str = "", cache: dict | None = None
+    question: str,
+    options: list[str] | None,
+    resume_profile: str,
+    job_description: str = "",
+    cache: dict | None = None,
+    durable_lookup=None,
+    durable_save=None,
 ) -> str | None:
     """Drafts an answer to a job-application screening question, grounded
     only in resume_profile. Returns None (never a guess) if the resume
@@ -430,6 +471,12 @@ def draft_screening_answer(
     (see its docstring) — a dict the caller creates fresh once per apply
     cycle (not this function's job to manage), so repeat questions across
     jobs in the same cycle skip a redundant verification call.
+
+    `durable_lookup`/`durable_save`, if given, are also passed straight
+    through to _verify_screening_answer (see its docstring) — added
+    2026-09-06, roadmap item 3, so a repeat question skips a redundant
+    verification call across DIFFERENT apply cycles too, not just within
+    one.
     """
     if _mentions_salary(question):
         log.info("Screening question mentions salary/CTC — always skipping auto-answer: %r", question)
@@ -451,7 +498,9 @@ def draft_screening_answer(
     if options:
         for opt in options:
             if raw.strip().lower() == opt.strip().lower():
-                if _verify_screening_answer(question, opt, resume_profile, cache=cache):
+                if _verify_screening_answer(
+                    question, opt, resume_profile, cache=cache, durable_lookup=durable_lookup, durable_save=durable_save
+                ):
                     return opt
                 log.warning(
                     "Screening answer %r for %r failed independent verification — skipping.", opt, question

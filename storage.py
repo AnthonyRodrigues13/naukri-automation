@@ -67,6 +67,34 @@ CREATE TABLE IF NOT EXISTS run_history (
     cycle TEXT NOT NULL,
     ran_at TEXT NOT NULL
 );
+
+-- Tracks when each (keywords, location) search combo was last run, so
+-- `search --auto` can rotate through config.SEARCH_QUERIES by picking
+-- whichever combo is most overdue -- added 2026-09-06, JOB_SEARCH_STRATEGY.md
+-- roadmap item 4. Separate from run_history (which only tracks "was the
+-- search CYCLE run," not which specific keywords/location it used).
+CREATE TABLE IF NOT EXISTS search_runs (
+    keywords TEXT,
+    location TEXT,
+    ran_at TEXT NOT NULL,
+    PRIMARY KEY (keywords, location)
+);
+
+-- Durable, cross-cycle counterpart to scoring._verify_screening_answer's
+-- in-memory `cache` -- added 2026-09-06 for cross-cycle screening-answer
+-- memory (see DECISIONS.md and JOB_SEARCH_STRATEGY.md roadmap item 3).
+-- Keyed on resume_hash in addition to (question, answer): a verdict is
+-- only ever valid for the resume content it was actually checked against,
+-- so editing resume.md between cycles makes old verdicts invisible
+-- (never matched) rather than silently misapplied to the new content.
+CREATE TABLE IF NOT EXISTS screening_answers (
+    question TEXT,
+    answer TEXT,
+    resume_hash TEXT,
+    verified INTEGER,
+    recorded_at TEXT,
+    PRIMARY KEY (question, answer, resume_hash)
+);
 """
 
 
@@ -317,6 +345,30 @@ def get_last_run_times() -> dict:
         return {r["cycle"]: r["last_ran"] for r in rows}
 
 
+def record_search_run(keywords: str, location: str):
+    """Records that this (keywords, location) combo was searched just now
+    -- added 2026-09-06, JOB_SEARCH_STRATEGY.md roadmap item 4. Called for
+    EVERY search cycle (manually typed or `--auto`-picked), so
+    get_search_run_times() stays accurate regardless of how a search was
+    invoked. INSERT OR REPLACE: only the most recent run of a given combo
+    matters for `search --auto`'s rotation purposes."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO search_runs (keywords, location, ran_at) VALUES (?, ?, ?)",
+            (keywords, location, datetime.now().isoformat()),
+        )
+
+
+def get_search_run_times() -> dict:
+    """{(keywords, location): ran_at} for every combo ever searched --
+    added 2026-09-06, roadmap item 4. A combo never searched is simply
+    absent, exactly like get_last_run_times() above. Consumed by
+    orchestrator._pick_least_recently_run_query()."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT keywords, location, ran_at FROM search_runs").fetchall()
+        return {(r["keywords"], r["location"]): r["ran_at"] for r in rows}
+
+
 def get_applicable_jobs(min_fit_score: int) -> list[dict]:
     """Jobs scored at or above the threshold, not yet *really* applied to.
     Ordered by fit_score descending so the best matches are attempted first
@@ -363,4 +415,45 @@ def save_draft_reply(message_id: str, draft: str):
         conn.execute(
             "UPDATE messages SET draft_reply = ? WHERE message_id = ?",
             (draft, message_id),
+        )
+
+
+def get_screening_answer_verification(question: str, answer: str, resume_hash: str) -> bool | None:
+    """Durable, cross-cycle counterpart to scoring._verify_screening_answer's
+    in-memory `cache` -- added 2026-09-06, JOB_SEARCH_STRATEGY.md roadmap
+    item 3. Naukri visibly reuses standard screening questions verbatim
+    across postings (see DECISIONS.md), so a (question, answer) pair
+    verified once doesn't need a fresh LLM verification call every time it
+    recurs, even across different apply cycles/days -- unlike the
+    in-memory cache, which only survives one process run.
+
+    Keyed on resume_hash (a hash of resume.md's current content, computed
+    once per apply cycle by orchestrator.py) in addition to (question,
+    answer): a verdict is only ever a valid answer to "does THIS resume
+    support this exact claim," so if resume.md is edited between cycles,
+    old verdicts become invisible (never matched, not silently reused
+    against a resume they were never actually checked against) rather than
+    a stale answer resurfacing unnoticed. Returns None on a miss -- the
+    caller falls through to a real LLM verification call, same as an
+    in-memory cache miss."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT verified FROM screening_answers WHERE question = ? AND answer = ? AND resume_hash = ?",
+            (question, answer, resume_hash),
+        ).fetchone()
+        return bool(row["verified"]) if row else None
+
+
+def save_screening_answer_verification(question: str, answer: str, resume_hash: str, verified: bool):
+    """See get_screening_answer_verification. INSERT OR REPLACE: a
+    (question, answer, resume_hash) triple should always map to the same
+    verdict in principle (same resume, same claim, same question), but
+    this lets a later, independently-run verification for the same triple
+    overwrite rather than conflict -- matches PRIMARY KEY-based upsert
+    semantics used elsewhere in this module (e.g. upsert_job)."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO screening_answers (question, answer, resume_hash, verified, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (question, answer, resume_hash, int(verified), datetime.now().isoformat()),
         )
